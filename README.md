@@ -145,6 +145,16 @@ This repository has been validated locally **without executing destructive AD op
 
 Live AD tests remain environment-dependent. In the most recent validation session, the test machine was unable to discover a domain controller, so no production or lab AD changes were performed. Only run these scripts on a domain-joined machine with a reachable writable DC and an approved test OU.
 
+## Validation and Smoke Testing
+
+This repository has been validated locally without executing destructive AD operations:
+
+- `validate_repo.ps1` parses the full repository and confirms all PowerShell files are syntactically valid.
+- shared module imports and helper-level smoke tests pass for the LDAP escaping and provisioning input validation logic.
+- the audit report script successfully reads the existing JSONL log in read-only mode.
+
+Live AD tests are still environment-dependent. In this session, the current machine was unable to discover a domain controller, so no production or lab AD changes were performed. Use the scripts only on a domain-joined machine with a reachable writable DC and an approved test OU.
+
 ## Quick Start
 
 ### 1. Open the project folder

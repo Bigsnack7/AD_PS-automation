@@ -1,6 +1,275 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Test-DepartmentNames {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$DepartmentNames
+    )
+
+    $seenDepartments = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $validatedDepartments = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($departmentName in $DepartmentNames) {
+        if ($null -eq $departmentName) {
+            throw 'Department names cannot be null.'
+        }
+
+        $trimmedDepartmentName = $departmentName.Trim()
+
+        if ([string]::IsNullOrWhiteSpace($trimmedDepartmentName)) {
+            throw 'Department names cannot be blank or whitespace-only.'
+        }
+
+        if ($trimmedDepartmentName.Length -ne $departmentName.Length) {
+            throw "Department name '$departmentName' contains leading or trailing whitespace. Use a trimmed value."
+        }
+
+        if ($trimmedDepartmentName -match '[,+=<>;"\\/:*?\x00-\x1F]') {
+            throw "Department name '$trimmedDepartmentName' contains invalid OU characters. Remove commas, quotes, semicolons, plus signs, equals signs, angle brackets, forward slashes, colons, asterisks, question marks, or backslashes."
+        }
+
+        if (-not $seenDepartments.Add($trimmedDepartmentName)) {
+            throw "Duplicate department name '$trimmedDepartmentName' was provided."
+        }
+
+        $validatedDepartments.Add($trimmedDepartmentName)
+    }
+
+    return $validatedDepartments.ToArray()
+}
+
+function Get-ADInvocationContext {
+    param(
+        [string]$Server,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+
+    $context = @{}
+    if (-not [string]::IsNullOrWhiteSpace($Server)) { $context.Server = $Server }
+    if ($Credential) { $context.Credential = $Credential }
+    return $context
+}
+
+function New-RandomPassword {
+    param(
+        [ValidateRange(12, 256)]
+        [int]$Length = 24
+    )
+
+    $characterSet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+[]{};:,.<>?'
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $bytes = New-Object byte[] $Length
+    $rng.GetBytes($bytes)
+
+    $requiredCharacterSets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!@#$%^&*()-_=+[]{};:,.<>?')
+    $passwordChars = [System.Collections.Generic.List[char]]::new()
+    foreach ($requiredCharacterSet in $requiredCharacterSets) {
+        $passwordChars.Add($requiredCharacterSet[$bytes[$passwordChars.Count] % $requiredCharacterSet.Length])
+    }
+    for ($index = $passwordChars.Count; $index -lt $Length; $index++) {
+        $passwordChars.Add($characterSet[$bytes[$index] % $characterSet.Length])
+    }
+
+    for ($index = $passwordChars.Count - 1; $index -gt 0; $index--) {
+        $swapIndex = $bytes[$index % $bytes.Length] % ($index + 1)
+        $temporaryCharacter = $passwordChars[$index]
+        $passwordChars[$index] = $passwordChars[$swapIndex]
+        $passwordChars[$swapIndex] = $temporaryCharacter
+    }
+
+    $rng.Dispose()
+    return -join $passwordChars
+}
+
+function Test-PasswordComplexity {
+    param(
+        [Parameter(Mandatory)]
+        [string]$PasswordText
+    )
+
+    $categoryCount = 0
+
+    if ($PasswordText -match '[a-z]') { $categoryCount++ }
+    if ($PasswordText -match '[A-Z]') { $categoryCount++ }
+    if ($PasswordText -match '\d') { $categoryCount++ }
+    if ($PasswordText -match '[^A-Za-z0-9]') { $categoryCount++ }
+
+    return $categoryCount -ge 3
+}
+
+function Resolve-PasswordPatternText {
+    param(
+        [string]$Pattern,
+        [string]$Username = 'User01',
+        [string]$Token = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Pattern)) {
+        return $null
+    }
+
+    $normalizedPattern = $Pattern.Trim()
+    if ([string]::IsNullOrWhiteSpace($normalizedPattern)) {
+        return $null
+    }
+
+    $placeholderMatches = [regex]::Matches($normalizedPattern, '\{(\d+)\}')
+    if ($placeholderMatches.Count -eq 0) {
+        return $normalizedPattern
+    }
+
+    $formatValue = if (-not [string]::IsNullOrWhiteSpace($Token)) { $Token } else { $Username }
+    $supportedPlaceholders = @('0', '1', '2')
+    $unsupportedPlaceholders = @($placeholderMatches | ForEach-Object { $_.Groups[1].Value } | Where-Object { $_ -notin $supportedPlaceholders })
+    if ($unsupportedPlaceholders.Count -gt 0) {
+        throw "Password pattern '$Pattern' uses unsupported placeholder values: {$($unsupportedPlaceholders[0])}. Supported placeholders are {0}, {1}, and {2}."
+    }
+
+    $usernameValue = if ([string]::IsNullOrWhiteSpace($Username)) { 'User01' } else { $Username }
+    $tokenValue = if ([string]::IsNullOrWhiteSpace($Token)) { $formatValue } else { $Token }
+    return $normalizedPattern -f $usernameValue, $tokenValue, $tokenValue
+}
+
+function Get-UniqueSamAccountName {
+    param(
+        [Parameter(Mandatory)][string]$BaseName,
+        [System.Collections.Generic.HashSet[string]]$UsedNames
+    )
+
+    $decomposed = $BaseName.Normalize([System.Text.NormalizationForm]::FormD)
+    $withoutDiacritics = -join ($decomposed.ToCharArray() | Where-Object {
+        [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark
+    })
+
+    $sanitizedBaseName = ($withoutDiacritics -replace '[^a-zA-Z0-9.]', '').ToLowerInvariant().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($sanitizedBaseName)) {
+        throw "Cannot determine a valid SAM account name from '$BaseName'."
+    }
+
+    if ($sanitizedBaseName -notmatch '[A-Za-z]') {
+        throw "Cannot derive a meaningful SAM account name from '$BaseName'. Use a value that includes at least one letter."
+    }
+
+    $candidate = $sanitizedBaseName
+    if ($candidate.Length -gt 20) {
+        $candidate = $candidate.Substring(0, 20).TrimEnd('.')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        throw "The generated SAM account name from '$BaseName' is empty after sanitization."
+    }
+
+    $suffix = 1
+    $uniqueName = $candidate
+    while ($true) {
+        $nameAlreadyUsed = $UsedNames -and $UsedNames.Contains($uniqueName)
+        if (-not $nameAlreadyUsed) { break }
+
+        $suffix++
+        $suffixText = [string]$suffix
+        $maxLength = [Math]::Max(1, 20 - $suffixText.Length)
+        $uniqueName = "$($candidate.Substring(0, [Math]::Min($candidate.Length, $maxLength)))$suffixText"
+        $uniqueName = $uniqueName.TrimEnd('.')
+    }
+
+    if ($UsedNames) { [void]$UsedNames.Add($uniqueName) }
+    return $uniqueName
+}
+
+function Get-ADFailureCategory {
+    param(
+        [Parameter(Mandatory)]
+        [object]$ErrorRecord
+    )
+
+    $exception = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    $errorId = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { [string]$ErrorRecord.FullyQualifiedErrorId } else { '' }
+    $category = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { [string]$ErrorRecord.CategoryInfo.Category } else { '' }
+    $categoryReason = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { [string]$ErrorRecord.CategoryInfo.Reason } else { '' }
+    $messageParts = [System.Collections.Generic.List[string]]::new()
+    $currentException = $exception
+    while ($null -ne $currentException) {
+        if (-not [string]::IsNullOrWhiteSpace($currentException.Message)) { $messageParts.Add($currentException.Message) }
+        $currentException = $currentException.InnerException
+    }
+    $message = $messageParts -join ' '
+    $structuredText = "$errorId $category $categoryReason"
+    $errorCodes = [System.Collections.Generic.HashSet[int]]::new()
+    $currentException = $exception
+    while ($null -ne $currentException) {
+        foreach ($propertyName in @('ErrorCode', 'HResult')) {
+            $property = $currentException.PSObject.Properties[$propertyName]
+            if ($null -ne $property -and $null -ne $property.Value) {
+                try { $null = $errorCodes.Add([int]$property.Value) } catch { }
+            }
+        }
+        $currentException = $currentException.InnerException
+    }
+
+    $normalizedErrorCodes = @($errorCodes | ForEach-Object { $_; $_ -band 0xffff })
+    $isDuplicateCode = @($normalizedErrorCodes | Where-Object { $_ -in @(68, 183, 5010, 8439) }).Count -gt 0
+    $isAccessDeniedCode = @($normalizedErrorCodes | Where-Object { $_ -eq 5 }).Count -gt 0
+    $isPasswordPolicyCode = @($normalizedErrorCodes | Where-Object { $_ -in @(1325, 2245) }).Count -gt 0
+
+    if ($isDuplicateCode -or $structuredText -match '(?i)alreadyexists|objectexists|duplicate|entryalreadyexists') {
+        return 'UsernameAlreadyExists'
+    }
+
+    if ($structuredText -match '(?i)duplicate|conflict|entryalreadyexists') {
+        return 'DuplicateUser'
+    }
+
+    if ($isPasswordPolicyCode -or $structuredText -match '(?i)password|passwordrestriction|passwordpolicy|constraintviolation') {
+        return 'InvalidPassword'
+    }
+
+    if ($isAccessDeniedCode -or $structuredText -match '(?i)accessdenied|unauthorized|permission|insufficientprivilege|authorization') {
+        return 'PermissionDenied'
+    }
+
+    if ($structuredText -match '(?i)notfound|objectnotfound|directorynotfound|organizationalunit') {
+        return 'OUUnavailable'
+    }
+
+    if ($structuredText -match '(?i)domain|ldap|serverunavailable|connection|transport|directoryservice') {
+        return 'DomainUnavailable'
+    }
+
+    if ($structuredText -match '(?i)network|rpc|remoteserver|host') {
+        return 'NetworkFailure'
+    }
+
+    if ($message -match '(?i)already exists|already in use|object with that name already exists') { return 'UsernameAlreadyExists' }
+    if ($message -match '(?i)duplicate|conflict') { return 'DuplicateUser' }
+    if ($message -match '(?i)invalid password|password does not meet|password.*policy|password.*complexity') { return 'InvalidPassword' }
+    if ($message -match '(?i)access is denied|permission denied|not authorized|unauthorized|insufficient rights') { return 'PermissionDenied' }
+    if ($message -match '(?i)organizational unit|ou=|not found|does not exist|cannot find object') { return 'OUUnavailable' }
+    if ($message -match '(?i)domain|ldap|server unavailable|network|connection|timed out|transport') { return 'DomainUnavailable' }
+    if ($message -match '(?i)unable to contact|cannot contact|no such host|remote server|rpc') { return 'NetworkFailure' }
+
+    return 'UnknownError'
+}
+
+function Get-ADCreateFailureDetails {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Username,
+
+        [Parameter(Mandatory)]
+        [string]$ErrorCategory,
+
+        [Parameter(Mandatory)]
+        [string]$OriginalMessage
+    )
+
+    if ($ErrorCategory -eq 'UsernameAlreadyExists') {
+        return "sAMAccountName '$Username' is already in use by another AD object, or another process created it after the pre-check. This is a naming collision/race-condition; the script did not retry automatically."
+    }
+
+    return $OriginalMessage
+}
+
 function Validate-ADProvisioningInput {
     param(
         [string[]]$Departments,
@@ -825,4 +1094,4 @@ function Invoke-ProvisioningRollback {
     return [pscustomobject]@{ RolledBack = $true; AccountsRemoved = $State.CreatedAccounts.Count }
 }
 
-Export-ModuleMember -Function 'Initialize-ADProvisioning', 'Test-ADProvisioningPreflight', 'Test-ADProvisioningTargetPermissions', 'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser', 'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation', 'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback'
+Export-ModuleMember -Function 'Test-DepartmentNames', 'Get-ADInvocationContext', 'New-RandomPassword', 'Test-PasswordComplexity', 'Resolve-PasswordPatternText', 'Get-UniqueSamAccountName', 'Get-ADFailureCategory', 'Get-ADCreateFailureDetails', 'Initialize-ADProvisioning', 'Test-ADProvisioningPreflight', 'Test-ADProvisioningTargetPermissions', 'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser', 'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation', 'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback'
