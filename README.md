@@ -89,8 +89,13 @@ flowchart LR
 
 - Account names are checked against existing AD accounts and names generated in the same run before any suffixing.
 - Users are enabled and their required department attributes validated immediately after creation.
+- For a stricter enablement sequence, use `-EnableAccountsAfterVerification` to create users and administrators disabled, verify their attributes and group membership, then enable and re-verify each account.
 - Failures capture structured error metadata, and the report includes execution context (domain, forest, DC, operator, timestamp, PowerShell version, OS).
 - With `-RollbackCreatedAccountsOnFailure`, only accounts created by the current run are removed. See [Limitations](#limitations).
+
+`mark42.ps1` is the canonical provisioning implementation. `ActiveDirectory-Provisioner.ps1`
+and `Generate-ADUsers.ps1` retain their command-line interfaces as compatibility wrappers, so fixes
+to provisioning behavior are maintained in one implementation.
 
 ## Default OU layout
 
@@ -139,6 +144,14 @@ $securePassword = ConvertTo-SecureString 'Use-A-Strong-Lab-Password' -AsPlainTex
 
 Random passwords are generated unless you supply a pattern or a password. Custom patterns are checked against the domain default policy and any readable fine-grained policy metadata before creation starts; final enforcement still happens at creation time.
 
+`-EnableAccountsAfterVerification` creates accounts disabled, verifies their provisioning
+attributes and group membership, then enables and verifies them. This option is available through
+`mark42.ps1` and both compatibility entry points.
+
+`Generate-ADUsers.ps1` retains its previous defaults: `-AccountCount 0` creates no standard users
+and departmental administrator creation remains opt-in. `ActiveDirectory-Provisioner.ps1` retains
+its live-run password-source and `-PasswordFile` requirements for credential export.
+
 ## Script reference
 
 **Provisioning and cleanup**
@@ -146,7 +159,8 @@ Random passwords are generated unless you supply a pattern or a password. Custom
 | Script | Purpose |
 | --- | --- |
 | `mark42.ps1` | Bulk provisioning: OUs, groups, users, administrator accounts, CSV report |
-| `ActiveDirectory-Provisioner.ps1` | Core provisioner (requires `-PasswordFile` when exporting) |
+| `ActiveDirectory-Provisioner.ps1` | Compatibility wrapper for `mark42.ps1` (requires `-PasswordFile` when exporting) |
+| `Generate-ADUsers.ps1` | Compatibility wrapper for `mark42.ps1`, including disabled-create/verify/enable |
 | `New_User_Script.ps1` | Create a single user with explicit attributes |
 | `Export-Test-Users.ps1` | CSV snapshot of generated users |
 | `Remove-Test-Users.ps1` | Lab cleanup entry point (wraps `2_RESET_TEST_USERS.ps1`) |
@@ -178,7 +192,7 @@ Termination keeps the existing description, avoids repeating the same dated note
 | Script / module | Purpose |
 | --- | --- |
 | `Script_AD_Audit_Report.ps1` | Summarize and filter the audit log; export CSV or JSON |
-| `Script_AD_Security_Report.ps1` | Locked and inactive accounts, department coverage |
+| `Script_AD_Security_Report.ps1` | Locked and inactive accounts, including older never-logged-on accounts, plus department coverage |
 | `AD-Operations.psm1` | Shared helpers: DC targeting, identity resolution, audit logging, CSV utilities |
 | `AD-Provisioning.psm1` | Provisioning logic and support functions |
 | `validate_repo.ps1` | Parser validation for every script and module |
@@ -206,6 +220,7 @@ Previews and declined confirmations are logged differently from attempted change
 **Credentials**
 
 - Credential export is **off by default**. Use `-ExportPasswords` to opt in; `mark42.ps1` then writes `user-passwords.clixml` beside the script unless you pass `-PasswordFile`.
+- `ActiveDirectory-Provisioner.ps1` requires `-PasswordFile` when `-ExportPasswords` is used. `Generate-ADUsers.ps1` forwards to the canonical export behavior.
 - Export requires Windows. The file is written with `Export-Clixml` (DPAPI, current user and machine), staged with a restrictive ACL, and published only after staging succeeds. Existing files are not replaced unless you pass `-OverwritePasswordFile`.
 - The export is not a credential vault. Restrict access and set a retention policy.
 - `-IncludePasswordInReport` writes **plaintext** passwords to the CSV. Avoid it except for a specifically approved need, and remove the report promptly.
@@ -226,7 +241,7 @@ Offline checks (no AD connection, no writes):
 .\Tests\Run-OfflineTests.ps1   # regression suite, prints pass/fail totals
 ```
 
-The suite covers LDAP/DN escaping (including escaped commas), identity-not-found classification, termination descriptions, staged secure file publishing, opt-in credential export, secure-string cleanup, context cleanup, password generation and pattern parsing, name normalization, group validation, and SID-scoped delegation checks.
+The suite covers LDAP/DN escaping (including escaped commas), identity-not-found classification, inactive-account cutoff behavior (including never-logged-on accounts), termination descriptions, staged secure file publishing, opt-in credential export, compatibility-entry-point forwarding, disabled-create/verify/enable safeguards, secure-string cleanup, context cleanup, password generation and pattern parsing, name normalization, group validation, and SID-scoped delegation checks.
 
 **Not covered:** AD provider behavior, Windows ACL enforcement, permissions, replication, and live rollback. Verify those in an authorized lab with a writable DC and a dedicated test OU. `-WhatIf` can still run read-only AD queries, so it is not an offline simulation.
 

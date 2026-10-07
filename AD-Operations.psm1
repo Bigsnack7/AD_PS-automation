@@ -47,6 +47,7 @@ function Assert-ADOperationsDependencies {
         'Move-ADSecuredFileIntoPlace',
         'Get-ADDistinguishedNameParent',
         'Test-ADIdentityNotFoundError',
+        'Test-ADAccountInactive',
         'ConvertTo-DistinguishedNameValue',
         'ConvertTo-LdapFilterValue',
         'Get-ADValidatedSecurityGroupSid',
@@ -342,6 +343,27 @@ function Test-ADIdentityNotFoundError {
     return ([string]$ErrorRecord.FullyQualifiedErrorId -match '(^|,)ADIdentityNotFound(,|$)')
 }
 
+function Test-ADAccountInactive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$User,
+
+        [Parameter(Mandatory)]
+        [datetime]$Cutoff
+    )
+
+    if ($User.LastLogonDate) {
+        return ([datetime]$User.LastLogonDate -lt $Cutoff)
+    }
+
+    if (-not $User.WhenCreated) {
+        return $false
+    }
+
+    return ([datetime]$User.WhenCreated -lt $Cutoff)
+}
+
 function Get-ADValidatedSecurityGroupSid {
     [CmdletBinding()]
     param(
@@ -600,4 +622,4 @@ function Export-ADResults {
     $Results | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force
     Write-Host "Results exported to $Path" -ForegroundColor Green
 }
-Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
+Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
