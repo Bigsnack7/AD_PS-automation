@@ -86,6 +86,28 @@ $connectivityError = [System.Management.Automation.ErrorRecord]::new(
 Assert-True (Test-ADIdentityNotFoundError -ErrorRecord $notFoundError) 'AD identity-not-found classification recognizes its error ID'
 Assert-True (-not (Test-ADIdentityNotFoundError -ErrorRecord $connectivityError)) 'AD identity-not-found classification does not infer from message text'
 
+$inactiveCutoff = [datetime]::new(2026, 7, 9)
+$oldNeverLoggedOnIsInactive = Test-ADAccountInactive -User ([pscustomobject]@{
+    LastLogonDate = $null
+    WhenCreated = [datetime]::new(2026, 1, 1)
+}) -Cutoff $inactiveCutoff
+Assert-True $oldNeverLoggedOnIsInactive 'Never-logged-on accounts older than the cutoff are inactive'
+$newNeverLoggedOnIsInactive = Test-ADAccountInactive -User ([pscustomobject]@{
+    LastLogonDate = $null
+    WhenCreated = [datetime]::new(2026, 9, 1)
+}) -Cutoff $inactiveCutoff
+Assert-True (-not $newNeverLoggedOnIsInactive) 'Never-logged-on accounts created after the cutoff are not inactive'
+$oldLastLogonIsInactive = Test-ADAccountInactive -User ([pscustomobject]@{
+    LastLogonDate = [datetime]::new(2026, 1, 1)
+    WhenCreated = [datetime]::new(2025, 1, 1)
+}) -Cutoff $inactiveCutoff
+Assert-True $oldLastLogonIsInactive 'Accounts with an old last logon are inactive'
+$recentLastLogonIsInactive = Test-ADAccountInactive -User ([pscustomobject]@{
+    LastLogonDate = [datetime]::new(2026, 8, 1)
+    WhenCreated = [datetime]::new(2025, 1, 1)
+}) -Cutoff $inactiveCutoff
+Assert-True (-not $recentLastLogonIsInactive) 'Accounts with a recent last logon are not inactive'
+
 $fixedTerminationDate = [datetime]::new(2026, 10, 7)
 $terminationDescription = New-ADTerminationDescription -ExistingDescription 'Existing employee note' -Reason 'Role ended' -TerminationDate $fixedTerminationDate
 Assert-True ($terminationDescription -ceq 'Existing employee note | TERMINATED on 2026-10-07 - Reason: Role ended') 'Termination note preserves existing description'
@@ -128,7 +150,7 @@ finally {
     Remove-Item -LiteralPath $fileTestRoot -Recurse -Force -ErrorAction Stop
 }
 
-$credentialExportScripts = @('mark42.ps1', 'ActiveDirectory-Provisioner.ps1')
+$credentialExportScripts = @('mark42.ps1')
 $allExportsOptIn = $true
 $allExportsUseSecurePublisher = $true
 foreach ($scriptName in $credentialExportScripts) {
@@ -161,10 +183,92 @@ foreach ($scriptName in $credentialExportScripts) {
 Assert-True $allExportsOptIn 'Provisioning scripts do not silently enable password export'
 Assert-True $allExportsUseSecurePublisher 'Credential exports use a restricted staging file rather than writing directly to their destinations'
 
+$expectedCompatibilityParameters = @(
+    'AccountCount',
+    'OrganizationalUnitName',
+    'StaffNamesOrganizationalUnitName',
+    'NamesPath',
+    'Departments',
+    'AdministratorUsername',
+    'CreateDepartmentAdministrators',
+    'AdministratorsOnly',
+    'PasswordPattern',
+    'AdministratorPasswordPattern',
+    'PasswordFile',
+    'ExportPasswords',
+    'OverwritePasswordFile',
+    'ReportPath',
+    'RollbackCreatedAccountsOnFailure',
+    'Password',
+    'Server',
+    'UPNSuffix',
+    'Credential',
+    'AuditLogPath'
+)
+$compatibilityEntrypointsForwardToCanonical = $true
+foreach ($scriptName in @('ActiveDirectory-Provisioner.ps1', 'Generate-ADUsers.ps1')) {
+    $scriptPath = Join-Path $repoRoot $scriptName
+    $scriptTokens = $null
+    $scriptParseErrors = $null
+    $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$scriptTokens, [ref]$scriptParseErrors)
+    $entrypointParameters = @($scriptAst.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    foreach ($parameterName in $expectedCompatibilityParameters) {
+        if ($parameterName -notin $entrypointParameters) { $compatibilityEntrypointsForwardToCanonical = $false }
+    }
+
+    $entrypointFunctions = @($scriptAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true))
+    $canonicalDispatch = $scriptAst.Extent.Text.Contains('& $canonicalScriptPath @forwardArguments')
+    if ($entrypointFunctions.Count -gt 0 -or -not $canonicalDispatch) {
+        $compatibilityEntrypointsForwardToCanonical = $false
+    }
+}
+Assert-True $compatibilityEntrypointsForwardToCanonical 'Provisioning compatibility entry points forward to mark42 and preserve shared CLI parameters'
+
+$generateEntrySource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Generate-ADUsers.ps1'))
+$generatePreservesLegacyDefaults = $generateEntrySource.Contains("`$forwardArguments['DisableDepartmentAdministratorsByDefault'] = `$true") -and
+    $generateEntrySource.Contains("`$forwardArguments['TreatZeroAccountCountAsNone'] = `$true")
+Assert-True $generatePreservesLegacyDefaults 'Generate-ADUsers preserves its legacy zero-count and administrator defaults'
+
+$generateAstTokens = $null
+$generateAstErrors = $null
+$generateAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $repoRoot 'Generate-ADUsers.ps1'),
+    [ref]$generateAstTokens,
+    [ref]$generateAstErrors
+)
+$generateHasSafeEnableSwitch = @($generateAst.ParamBlock.Parameters | Where-Object {
+    $_.Name.VariablePath.UserPath -eq 'EnableAccountsAfterVerification'
+}).Count -eq 1
+Assert-True $generateHasSafeEnableSwitch 'Generate-ADUsers retains the disabled-create/verify/enable option'
+
 $mark42Path = Join-Path $repoRoot 'mark42.ps1'
 $mark42Tokens = $null
 $mark42ParseErrors = $null
 $mark42Ast = [System.Management.Automation.Language.Parser]::ParseFile($mark42Path, [ref]$mark42Tokens, [ref]$mark42ParseErrors)
+$safeEnableFunction = @($mark42Ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Enable-VerifiedProvisionedAccount'
+}, $true)) | Select-Object -First 1
+$safeEnableSource = if ($safeEnableFunction) { $safeEnableFunction.Extent.Text } else { '' }
+$safeEnableWorkflowIsVerified = $safeEnableSource -match 'Enable-ADAccount' -and
+    $safeEnableSource -match 'Test-ADProvisionedUser' -and
+    $safeEnableSource -match 'RequireEnabled'
+Assert-True $safeEnableWorkflowIsVerified 'Canonical provisioner enables accounts only through the verification helper'
+
+$mark42NewUserCommands = @($mark42Ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -eq 'New-ADUser'
+}, $true))
+$disabledCreatePaths = @($mark42NewUserCommands | Where-Object {
+    $_.Extent.Text -match '(?s)-Enabled\s+\(-not\s+\$EnableAccountsAfterVerification\)'
+}).Count
+Assert-True ($disabledCreatePaths -ge 2) 'Canonical provisioner can create both standard and administrator accounts disabled'
+
 $plainTextConversionHelper = @($mark42Ast.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

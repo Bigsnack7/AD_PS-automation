@@ -25,6 +25,9 @@
 .EXAMPLE
     .\mark42.ps1 -AccountCount 100 -OrganizationalUnitName 'Company'
 
+.EXAMPLE
+    .\mark42.ps1 -AccountCount 100 -EnableAccountsAfterVerification
+
 .PARAMETER AccountCount
     Number of users to create.
     Use 0 to create one account for every valid name in the names file. If the requested count exceeds
@@ -72,6 +75,13 @@
     Allows an existing password export file to be overwritten. Use this only when you intentionally want
     to replace the prior export file contents.
 
+.PARAMETER EnableAccountsAfterVerification
+    Creates user and administrator accounts disabled, verifies their attributes and group membership,
+    then enables each account and verifies the enabled state.
+
+.PARAMETER TreatZeroAccountCountAsNone
+    Compatibility option for entry points where -AccountCount 0 means create no standard users.
+
 .PARAMETER IncludePasswordInReport
     Opt-in switch that adds a plaintext Password column to the CSV written to -ReportPath, alongside
     Username and Department, for every account this run actually created. Unlike -PasswordFile (which
@@ -118,6 +128,14 @@ param(
 
     [switch]$IncludePasswordInReport,
 
+    [switch]$EnableAccountsAfterVerification,
+
+    [Parameter(DontShow)]
+    [switch]$TreatZeroAccountCountAsNone,
+
+    [Parameter(DontShow)]
+    [switch]$DisableDepartmentAdministratorsByDefault,
+
     [string]$ReportPath = '',
 
     [Alias('RollbackOnFailure', 'RollbackAccountsOnFailure')]
@@ -161,7 +179,8 @@ if ([string]::IsNullOrWhiteSpace($ReportPath)) {
     $ReportPath = Join-Path $scriptDirectory 'AD-Provisioning-Report.csv'
 }
 
-if (-not $AdministratorsOnly -and -not (Test-Path -LiteralPath $NamesPath -PathType Leaf)) {
+if (-not $AdministratorsOnly -and -not ($TreatZeroAccountCountAsNone -and $AccountCount -eq 0) -and
+    -not (Test-Path -LiteralPath $NamesPath -PathType Leaf)) {
     throw "Names file not found: $NamesPath"
 }
 
@@ -177,6 +196,11 @@ else {
     $true
 }
 $createDepartmentAdministrators = $createDepartmentAdministrators -or (-not [string]::IsNullOrWhiteSpace($AdministratorUsername))
+if ($DisableDepartmentAdministratorsByDefault -and
+    -not $PSBoundParameters.ContainsKey('CreateDepartmentAdministrators') -and
+    [string]::IsNullOrWhiteSpace($AdministratorUsername)) {
+    $createDepartmentAdministrators = $false
+}
 
 if ($AdministratorsOnly -and -not $createDepartmentAdministrators) {
     throw '-AdministratorsOnly requires department administrators to be enabled. Remove -CreateDepartmentAdministrators:$false or omit -AdministratorsOnly.'
@@ -324,7 +348,7 @@ function Invoke-ADPreflight {
             }
 
             $departmentUserOuDistinguishedName = if ($departmentUserOu.Count -eq 1) { $departmentUserOu[0].DistinguishedName } else { '' }
-            if (-not $AdministratorsOnly) {
+            if (-not $AdministratorsOnly -and -not ($TreatZeroAccountCountAsNone -and $AccountCount -eq 0)) {
                 $departmentUserOuStatus = if ([string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName)) { 'NeedsAttention' } else { 'Passed' }
                 Add-PreflightCheck -Name "Department Users OU: $department" -Status $departmentUserOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName)) { "Department Users OU for '$department' is not present yet and will be created during Phase 2." } else { "Department Users OU for '$department' already exists at '$departmentUserOuDistinguishedName'." })
             }
@@ -1051,7 +1075,7 @@ if (-not $AdministratorsOnly) {
 
     Write-Verbose "Loaded $($nameRecords.Count) valid names from '$NamesPath'."
 
-    if ($AccountCount -eq 0) {
+    if ($AccountCount -eq 0 -and -not $TreatZeroAccountCountAsNone) {
         Write-Verbose "AccountCount is 0, so all $($nameRecords.Count) available valid names will be used."
         $AccountCount = $nameRecords.Count
     }
@@ -1065,7 +1089,7 @@ else {
     $nameRecords = @()
     Write-Verbose "AdministratorsOnly mode is enabled; no source names will be loaded."
 }
-$usersToCreate = if ($AdministratorsOnly) { 0 } else { $AccountCount }
+$usersToCreate = if ($AdministratorsOnly -or ($TreatZeroAccountCountAsNone -and $AccountCount -eq 0)) { 0 } else { $AccountCount }
 Write-Verbose "Requested user creation count is $usersToCreate."
 
 $domain = Get-ADDomain @adContext -ErrorAction Stop
@@ -1302,6 +1326,43 @@ function Test-ADProvisionedUser {
     }
 
     return $verifiedUser
+}
+
+function Enable-VerifiedProvisionedAccount {
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$CreatedAccount,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedDepartment,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedUserPrincipalName,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedOrganizationalUnit
+    )
+
+    if (-not $EnableAccountsAfterVerification) {
+        return
+    }
+
+    $accountBeforeEnable = Get-ADUser @adContext -Identity $CreatedAccount.DistinguishedName -Properties Enabled -ErrorAction Stop
+    if ($accountBeforeEnable.Enabled) {
+        throw "Account '$($CreatedAccount.SamAccountName)' was expected to remain disabled until verification."
+    }
+
+    Enable-ADAccount @adContext -Identity $accountBeforeEnable -Confirm:$false -ErrorAction Stop
+    $null = Test-ADProvisionedUser -CreatedAccount $CreatedAccount `
+        -ExpectedDepartment $ExpectedDepartment `
+        -ExpectedUserPrincipalName $ExpectedUserPrincipalName `
+        -ExpectedOrganizationalUnit $ExpectedOrganizationalUnit `
+        -RequireEnabled -RequirePasswordChangeAtLogon
+    Write-ADProvisioningAuditRecord -Action 'EnableVerifiedAccount' `
+        -Target $CreatedAccount.DistinguishedName `
+        -TargetType 'User' `
+        -Status 'Succeeded' `
+        -Details "Enabled '$($CreatedAccount.SamAccountName)' only after provisioning attributes and membership were verified."
 }
 
 function Grant-DepartmentUserDelegation {
@@ -1820,7 +1881,7 @@ try {
                            -PasswordNeverExpires:$false `
                            -ChangePasswordAtLogon:$true `
                            -Path $departmentAdministratorOUs[$department] `
-                           -Enabled $true `
+                           -Enabled (-not $EnableAccountsAfterVerification) `
                            -PassThru `
                            -ErrorAction Stop
 
@@ -1863,9 +1924,9 @@ try {
                 $adminPlainTextPasswordForReport = $null
 
                 try {
-                    $verifiedAdminAccount = Test-ADProvisionedUser -CreatedAccount $createdAdminAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$adminUsername@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentAdministratorOUs[$department] -RequireEnabled -RequirePasswordChangeAtLogon
+                    $verifiedAdminAccount = Test-ADProvisionedUser -CreatedAccount $createdAdminAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$adminUsername@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentAdministratorOUs[$department] -RequireEnabled:(-not $EnableAccountsAfterVerification) -RequirePasswordChangeAtLogon
                     $reportRecord.Stage = 'UserVerified'
-                    Write-ADProvisioningAuditRecord -Action 'VerifyUser' -Target $verifiedAdminAccount.DistinguishedName -TargetType 'User' -Status 'Succeeded' -Details "Verified department administrator '$adminUsername' exists in '$($departmentAdministratorOUs[$department])', is enabled, and has the expected UPN/department configuration."
+                    Write-ADProvisioningAuditRecord -Action 'VerifyUser' -Target $verifiedAdminAccount.DistinguishedName -TargetType 'User' -Status 'Succeeded' -Details "Verified department administrator '$adminUsername' exists in '$($departmentAdministratorOUs[$department])' with the expected UPN and department configuration."
                 }
                 catch {
                     $adminHadPartialFailure = $true
@@ -1890,7 +1951,11 @@ try {
                     Write-ADProvisioningAuditRecord -Action 'AddGroupMember' -Target "$($createdAdminAccount.DistinguishedName) -> $($departmentAdministratorGroups[$department].DistinguishedName)" -TargetType 'GroupMembership' -Status 'Succeeded' -Details "Added administrator '$adminUsername' to department group '$($departmentAdministratorGroups[$department].Name)'."
                     $reportRecord.Stage = 'GroupMembershipAdded'
 
-                    $verifiedAdminAccount = Test-ADProvisionedUser -CreatedAccount $createdAdminAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$adminUsername@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentAdministratorOUs[$department] -ExpectedGroupDistinguishedName $departmentAdministratorGroups[$department].DistinguishedName -RequireGroupMembership -RequireEnabled -RequirePasswordChangeAtLogon
+                    $verifiedAdminAccount = Test-ADProvisionedUser -CreatedAccount $createdAdminAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$adminUsername@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentAdministratorOUs[$department] -ExpectedGroupDistinguishedName $departmentAdministratorGroups[$department].DistinguishedName -RequireGroupMembership -RequireEnabled:(-not $EnableAccountsAfterVerification) -RequirePasswordChangeAtLogon
+                    Enable-VerifiedProvisionedAccount -CreatedAccount $createdAdminAccount `
+                        -ExpectedDepartment $department `
+                        -ExpectedUserPrincipalName "$adminUsername@$effectiveUPNSuffix" `
+                        -ExpectedOrganizationalUnit $departmentAdministratorOUs[$department]
                     $reportRecord.Stage = 'Completed'
                     $reportRecord.Status = 'Succeeded'
                     $createdAdminCount++
@@ -2022,7 +2087,7 @@ for ($count = 1; $count -le $usersToCreate; $count++) {
                        -PasswordNeverExpires:$false `
                        -ChangePasswordAtLogon:$true `
                        -Path $departmentUserOUs[$department] `
-                       -Enabled $true `
+                       -Enabled (-not $EnableAccountsAfterVerification) `
                        -PassThru `
                        -ErrorAction Stop
             if ($createdAccount) {
@@ -2065,9 +2130,9 @@ for ($count = 1; $count -le $usersToCreate; $count++) {
             $reportRecords.Add($reportRecord)
 
             try {
-                $verifiedAccount = Test-ADProvisionedUser -CreatedAccount $createdAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$username@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentUserOUs[$department] -RequireEnabled -RequirePasswordChangeAtLogon
+                $verifiedAccount = Test-ADProvisionedUser -CreatedAccount $createdAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$username@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentUserOUs[$department] -RequireEnabled:(-not $EnableAccountsAfterVerification) -RequirePasswordChangeAtLogon
                 $reportRecord.Stage = 'UserVerified'
-                Write-ADProvisioningAuditRecord -Action 'VerifyUser' -Target $verifiedAccount.DistinguishedName -TargetType 'User' -Status 'Succeeded' -Details "Verified user '$username' exists in '$($departmentUserOUs[$department])', is enabled, and has the expected UPN/department configuration."
+                Write-ADProvisioningAuditRecord -Action 'VerifyUser' -Target $verifiedAccount.DistinguishedName -TargetType 'User' -Status 'Succeeded' -Details "Verified user '$username' exists in '$($departmentUserOUs[$department])' with the expected UPN and department configuration."
             }
             catch {
                 $userHadPartialFailure = $true
@@ -2092,7 +2157,11 @@ for ($count = 1; $count -le $usersToCreate; $count++) {
                 Write-ADProvisioningAuditRecord -Action 'AddGroupMember' -Target "$($createdAccount.DistinguishedName) -> $($departmentUserGroups[$department].DistinguishedName)" -TargetType 'GroupMembership' -Status 'Succeeded' -Details "Added user '$username' to department group '$($departmentUserGroups[$department].Name)'."
                 $reportRecord.Stage = 'GroupMembershipAdded'
 
-                $verifiedAccount = Test-ADProvisionedUser -CreatedAccount $createdAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$username@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentUserOUs[$department] -ExpectedGroupDistinguishedName $departmentUserGroups[$department].DistinguishedName -RequireGroupMembership -RequireEnabled -RequirePasswordChangeAtLogon
+                $verifiedAccount = Test-ADProvisionedUser -CreatedAccount $createdAccount -ExpectedDepartment $department -ExpectedUserPrincipalName "$username@$effectiveUPNSuffix" -ExpectedOrganizationalUnit $departmentUserOUs[$department] -ExpectedGroupDistinguishedName $departmentUserGroups[$department].DistinguishedName -RequireGroupMembership -RequireEnabled:(-not $EnableAccountsAfterVerification) -RequirePasswordChangeAtLogon
+                Enable-VerifiedProvisionedAccount -CreatedAccount $createdAccount `
+                    -ExpectedDepartment $department `
+                    -ExpectedUserPrincipalName "$username@$effectiveUPNSuffix" `
+                    -ExpectedOrganizationalUnit $departmentUserOUs[$department]
                 $reportRecord.Stage = 'Completed'
                 $reportRecord.Status = 'Succeeded'
                 $createdCount++

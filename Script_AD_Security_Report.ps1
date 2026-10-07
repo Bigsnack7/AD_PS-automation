@@ -140,7 +140,9 @@ try {
     $passwordNeverExpires = @($usersInScope | Where-Object { $_.PasswordNeverExpires -eq $true }).Count
 
     $inactiveCutoff = (Get-Date).AddDays(-90)
-    $inactiveAccounts = @($usersInScope | Where-Object { $_.LastLogonDate -and $_.LastLogonDate -lt $inactiveCutoff }).Count
+    $inactiveAccounts = @($usersInScope | Where-Object {
+        Test-ADAccountInactive -User $_ -Cutoff $inactiveCutoff
+    }).Count
 
     $departmentAdminCounts = @{}
     foreach ($department in $Departments) {
@@ -182,7 +184,7 @@ try {
         "Password Never Expires:",
         "  $passwordNeverExpires",
         '',
-        "Inactive Accounts (90+ days):",
+        "Inactive Accounts (90+ days, including never-logged-on accounts created before cutoff):",
         "  $inactiveAccounts",
         '',
         'Department Administrators:'

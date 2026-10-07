@@ -482,7 +482,7 @@ function Initialize-ADProvisioning {
 
         $domain = Get-ADDomain @script:adContext -ErrorAction Stop
         $forest = Get-ADForest @script:adContext -ErrorAction Stop
-        $executionContext = [pscustomobject]@{
+        $executionMetadata = [pscustomobject]@{
             Domain = $domain.DNSRoot
             Forest = $forest.Name
             DC = $resolvedServer
@@ -512,7 +512,7 @@ function Initialize-ADProvisioning {
         Credential = $Credential
         ADContext = $script:adContext
         AclDriveName = $aclDriveName
-        ExecutionContext = $executionContext
+        ExecutionContext = $executionMetadata
         UPNSuffix = $UPNSuffix
         DomainRoot = $domain.DistinguishedName
         DomainNetBIOSName = $domain.NetBIOSName
