@@ -1,494 +1,276 @@
 # AD_PS
 
-<p align="center">
-  <img src="https://img.shields.io/badge/PowerShell-5.1%20%7C%207+-5391D5?logo=powershell&logoColor=white" alt="PowerShell" />
-  <img src="https://img.shields.io/badge/Active%20Directory-Identity%20Automation-2DDE98?logo=microsoft&logoColor=white" alt="Active Directory" />
-  <img src="https://img.shields.io/badge/Lab%20Provisioning-Audit%20Ready-FF6B6B" alt="Lab Provisioning" />
-  <img src="https://img.shields.io/badge/Focus-AD%20Security%20%26%20Operations-8B5CF6" alt="AD Security" />
-</p>
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207+-5391D5?logo=powershell&logoColor=white)
+![Active Directory](https://img.shields.io/badge/Active%20Directory-Automation-2DDE98?logo=microsoft&logoColor=white)
+![Scope](https://img.shields.io/badge/Scope-Lab%20%2F%20Test-FF6B6B)
 
-<p align="center"><strong>A PowerShell toolkit for Active Directory provisioning, lifecycle administration, and operational reporting — built for controlled test and lab environments, with the safety and audit discipline of a production system.</strong></p>
+**PowerShell automation for Active Directory provisioning, user lifecycle administration, and audit reporting, built for lab and test environments with production-style safety habits.**
 
----
+AD_PS creates a department-based OU structure with scoped delegation, bulk-provisions test users, runs lifecycle operations (enable, disable, move, terminate, delete), and records every action as structured JSONL. Everything supports native `-WhatIf` / `-Confirm`, and every change is re-queried from the directory afterwards instead of assumed.
 
-## Table of Contents
+> **Scope:** Intended for lab, test, and controlled administrative use. Anything beyond a lab should go through your organization's change control and security review.
 
-- [Overview](#overview)
-- [Why This Toolkit](#why-this-toolkit)
-- [Repository Contents](#repository-contents)
-- [Key Capabilities](#key-capabilities)
-- [Requirements](#requirements)
-- [Validation and Smoke Testing](#validation-and-smoke-testing)
-- [Quick Start](#quick-start)
-- [Default Provisioning Layout](#default-provisioning-layout)
-- [Role Model and Delegation](#role-model-and-delegation)
-- [Core Usage Examples](#core-usage-examples)
-- [Audit Logging](#audit-logging)
-- [Security Notes](#security-notes)
-- [Administrative Script Catalog](#administrative-script-catalog)
-- [Input File Format](#input-file-format)
+## Contents
+
+- [Highlights](#highlights)
+- [Quick start](#quick-start)
+- [How a provisioning run works](#how-a-provisioning-run-works)
+- [Default OU layout](#default-ou-layout)
+- [Delegation model](#delegation-model)
+- [Common usage](#common-usage)
+- [Script reference](#script-reference)
+- [Audit logging](#audit-logging)
+- [Security model](#security-model)
+- [Testing](#testing)
+- [Limitations](#limitations)
+- [Cleanup](#cleanup)
 - [Troubleshooting](#troubleshooting)
-- [Cleanup and Reset](#cleanup-and-reset)
-- [Recommended Execution Flow](#recommended-execution-flow)
-- [Project Notes](#project-notes)
 - [Disclaimer](#disclaimer)
 
----
+## Highlights
 
-## Overview
-
-**AD_PS** is a professional PowerShell-based toolkit for automating Active Directory provisioning, lifecycle administration, and operational reporting in controlled test and lab environments.
-
-It brings together provisioning logic, administrative lifecycle scripts, JSONL audit logging, and reporting tools under a set of consistent, safety-conscious conventions. The project is designed to demonstrate — and to actually practice — the habits that separate a credible AD automation toolkit from a collection of ad hoc scripts:
-
-- identity automation with department-based OU modeling
-- explicit, reviewed attribute management rather than broad standing access
-- secure password handling, including optional DPAPI-protected exports
-- structured, machine-readable audit logging for every operation
-- native PowerShell `-WhatIf` / `-Confirm` semantics throughout, rather than a bespoke dry-run flag
-
-> This toolkit is intended for lab, test, and controlled administrative use. Production usage should always align with your organization's change control, approval processes, and security review requirements.
-
-## Why This Toolkit
-
-Most "AD automation script" collections skip the parts that matter once you're operating against a real directory: consistent audit trails, safe re-runs, explicit approval gates for destructive changes, and verification that a change actually took effect rather than just assuming the cmdlet succeeded. AD_PS is built around those habits from the ground up:
-
-- **Auditable by default** — every operational script writes structured JSONL records before and after the action it takes, not just on failure.
-- **Verified, not assumed** — lifecycle scripts re-query the directory after a change (group membership, enabled state, password state) rather than trusting that a cmdlet returning without error means the change is fully in effect.
-- **Destructive actions require explicit intent** — `-WhatIf` previews are always available, and irreversible operations require an additional, explicit approval switch on top of PowerShell's native confirmation model.
-- **Rerun-safe by design** — provisioning detects existing matching identities before creating new ones, so the same invocation can be run repeatedly without producing duplicate or colliding accounts.
-
-## Repository Contents
-
-| File | Purpose |
+| Principle | What it means in practice |
 | --- | --- |
-| `mark42.ps1` | Bulk provisioning script for test users, department OUs, administrator accounts, and CSV reporting. |
-| `ActiveDirectory-Provisioner.ps1` | Core provisioner for creating department OUs, users, and admin accounts in a repeatable way. |
-| `Export-Test-Users.ps1` | Exports a CSV snapshot of generated users from the target OU for review or cleanup. |
-| `Remove-Test-Users.ps1` | Lab-friendly cleanup script for removing generated users and optionally the test OU hierarchy. |
-| `AD-Operations.psm1` | Shared helper module for AD targeting, identity resolution, audit logging, CSV utilities, and reporting. |
-| `AD-Provisioning.psm1` | Provisioning logic and support functions used across the automation workflow. |
-| `Tests\Run-OfflineTests.ps1` | Offline regression tests for shared helpers; no AD connection or writes. |
-| `validate_repo.ps1` | PowerShell parser validation for scripts and modules in this repository. |
-| `Script_AD_Audit_Report.ps1` | Reads the JSONL audit log, filters by identity/action/status, and exports summaries or CSV output. |
-| `Script_AD_Security_Report.ps1` | Produces a high-level AD security summary, including locked accounts, inactive accounts, and department coverage. |
-| `New_User_Script.ps1` | Creates a single user with explicit attributes. |
-| `Script_Reset_User_Passwords.ps1` | Resets one or more user passwords. |
-| `Script_Unlock_User_Account.ps1` | Unlocks a locked AD account. |
-| `Script_Add_User_to_Group.ps1` | Adds a user to a group. |
-| `Script_Remove_User_from_Group.ps1` | Removes a user from a group. |
-| `Script_Disable_User.ps1` | Disables a specific user account. |
-| `Script_Enable_User.ps1` | Enables a specific user account. |
-| `Script_Move_User.ps1` | Moves a user to a target OU. |
-| `Script_Delete_User.ps1` | Deletes a user account. |
-| `Script_Terminate_User.ps1` | Disables a user, optionally moves the account, and applies a termination reason. |
-| `Script_Disable_Inactive_Users.ps1` | Disables accounts inactive beyond a configurable threshold. |
-| `Script_Find_Locked-Out_Users.ps1` | Lists locked accounts and supports CSV export. |
-| `2_RESET_TEST_USERS.ps1` | Removes generated test users, department groups, and optionally the test OU hierarchy. |
-| `nigerian-names.txt` | Default name source for generated test-user identities. |
+| **Auditable** | Every operational script writes structured JSONL records before and after the action, not only on failure. |
+| **Verified** | Lifecycle scripts re-query AD after a change (group membership, enabled state, password state) rather than trusting a cmdlet that returned without error. |
+| **Previewable** | Native `-WhatIf` / `-Confirm` everywhere. There is no custom dry-run flag. |
+| **Gated** | Destructive operations need an explicit switch such as `-AllowDestructiveOperation` on top of PowerShell's own confirmation. |
+| **Rerun-safe** | Existing matching identities are detected before creation, so repeating a run does not produce duplicate or colliding accounts. |
+| **Least privilege** | Department administrators get scoped lifecycle rights only. Attribute writes are reserved for a separate, explicitly reviewed group. |
 
-## Key Capabilities
+## Quick start
 
-### Provisioning
+**Requirements**
 
-- Bulk creation of users across department-specific OUs
-- Department-specific `Users` and `Administrators` OUs
-- Automatic creation of per-department security groups
-- Scoped OU delegation for departmental lifecycle administrators
-- Reserved `Department-Attribute-Admins` group for explicit, reviewed attribute changes
-- Username collision prevention using existing AD account names and generated SAM names
-- Rerun-safe identity detection that skips existing matching users before suffixing
-- CSV report generation for provisioning outcomes and failures
-- Execution context reporting, including domain, forest, DC, operator, timestamp, PowerShell version, and OS
-- Structured error metadata capture for AD and PowerShell failures
-- Verification of new OUs and post-create account attributes on the configured DC
-- Default lab behavior that enables accounts and validates required department attributes immediately after creation
+- Windows PowerShell 5.1 or PowerShell 7+
+- The `ActiveDirectory` module (install RSAT if `Import-Module ActiveDirectory` fails)
+- Network access to a writable domain controller
+- An account with the delegated rights you intend to use
+- A dedicated test OU and an approved change window
 
-### Security and Safe Defaults
-
-- Random passwords are generated by default
-- Credential export is disabled by default; explicitly pass `-ExportPasswords` to persist created account credentials
-- `mark42.ps1` defaults its explicitly enabled export to `user-passwords.clixml` beside the script; `ActiveDirectory-Provisioner.ps1` requires `-PasswordFile`
-- Credential export requires Windows and stages the `Export-Clixml` file with a restrictive ACL before publishing it; existing files are not replaced unless `-OverwritePasswordFile` is supplied
-- Password ACLs are restricted to the current Windows identity
-- Destructive operations require explicit approval switches in addition to `-WhatIf`
-- Preview behavior is driven by native PowerShell `-WhatIf` semantics
-- Preflight validation checks the expected OU, administrator group, and delegation state before creating accounts
-- Administrator groups used for OU delegation are validated by expected name, location, security category, Global scope, and SID
-- New delegation is granted only to a group created during the current run; a pre-existing group requires an already-present SID-matched delegation ACE
-- A single writable DC is resolved and reused for the full provisioning run
-- Audit actions are written to JSONL for review and incident response
-
-> The project intentionally avoids a custom dry-run switch. Use `-WhatIf` and `SupportsShouldProcess` to preview operations the standard PowerShell way.
-
-### Administration and Lifecycle
-
-- User enable and disable workflows
-- Group membership management
-- User move operations
-- User delete and termination workflows
-- Termination preserves the current description, avoids duplicating the same dated note, refuses to exceed the AD description length limit, and verifies the final account state.
-- Inactive-user cleanup support
-- Security and audit summary reporting
-
-## Requirements
-
-Run the scripts from a machine that meets the following requirements:
-
-1. Windows PowerShell 5.1 or PowerShell 7+
-2. The Active Directory PowerShell module installed
-3. Network reachability to a domain controller
-4. An appropriately delegated account with the required permissions
-5. An approved change window with a defined audit retention process
-
-## Validation and Smoke Testing
-
-Run these local smoke checks from the repository root. They do not connect to or modify Active Directory:
+**Run it**
 
 ```powershell
-.\validate_repo.ps1
-.\Tests\Run-OfflineTests.ps1
-```
-
-`validate_repo.ps1` parses every PowerShell script and module. `Tests\Run-OfflineTests.ps1` runs the offline regression suite and prints the pass/fail totals. Coverage includes LDAP/DN escaping (including escaped commas), AD identity-not-found classification, termination descriptions, secure staged-file publishing, opt-in credential export, secure-string memory cleanup, context cleanup, password generation and pattern parsing, name normalization, group validation, and SID-scoped delegation checks. Neither check verifies AD provider behavior, Windows ACL enforcement, permissions, replication, or live rollback. Validate those behaviors in an authorized lab with a reachable writable DC and a dedicated test OU. `-WhatIf` may still perform read-only AD queries and is not an offline simulation.
-
-## Quick Start
-
-### 1. Open the project folder
-
-```powershell
+# 1. Open the repo and confirm AD connectivity
 Set-Location 'C:\Path\To\AD_PS-master'
-```
-
-### 2. Validate Active Directory connectivity
-
-```powershell
 Import-Module ActiveDirectory
 Get-ADDomain
-```
 
-If `Import-Module ActiveDirectory` fails, install the RSAT Active Directory tools first.
-
-### 3. Preview bulk user creation
-
-```powershell
+# 2. Preview (no changes; may still run read-only AD queries)
 .\mark42.ps1 -AccountCount 5 -WhatIf
-```
 
-This preview shows the operations that would occur without modifying Active Directory.
-
-For multi-DC environments, pass a specific writable domain controller with `-Server` when needed. If `-Server` is omitted, the provisioning module resolves one writable DC at startup and reuses it for the remainder of the run, including post-create verification and delegation ACL changes.
-
-### 4. Create test users
-
-```powershell
+# 3. Create test users
 .\mark42.ps1 -AccountCount 5
-```
 
-By default, this creates users under the `Company` OU, builds departmental OUs beneath `Staff`, and creates `Users` and `Administrators` OUs under each department.
-
-Department administrator accounts and their groups are created by default. To create regular users without departmental admin resources, disable that behavior explicitly:
-
-```powershell
-.\mark42.ps1 -AccountCount 5 -CreateDepartmentAdministrators:$false
-```
-
-### 5. Export a snapshot of generated users
-
-```powershell
+# 4. Snapshot what was created
 .\Export-Test-Users.ps1 -OrganizationalUnitName 'Company'
-```
 
-This exports a CSV snapshot of the users under the target OU so you can preserve an inventory before running a security exercise or deleting the environment.
-
-### 6. Review the generated audit log
-
-```powershell
+# 5. Review the audit trail
 .\Script_AD_Audit_Report.ps1
-.\Script_AD_Audit_Report.ps1 -Identity 'chinedu.okafor'
-.\Script_AD_Audit_Report.ps1 -Action 'CreateUser' -Status 'Failed'
+
+# 6. Clean up (preview first)
+.\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
+.\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -AllowDestructiveOperation
 ```
 
-The audit report script reads `AD-Operations.jsonl`, summarizes the log, and can export filtered result sets to CSV or JSON.
+In multi-DC environments, pass `-Server <dc>` to choose the writable DC. If you omit it, one writable DC is resolved at startup and reused for the whole run, including verification and delegation ACL changes.
 
-## Default Provisioning Layout
+## How a provisioning run works
 
-The default model creates the following structure under the domain root:
+```mermaid
+flowchart LR
+    A[Resolve one writable DC] --> B[Preflight checks<br/>OU, admin group, delegation]
+    B --> C[Create OUs and<br/>department groups]
+    C --> D[Apply scoped delegation]
+    D --> E[Create users<br/>collision-safe names]
+    E --> F[Verify attributes<br/>and group membership]
+    F --> G[CSV report + JSONL audit]
+```
+
+- Account names are checked against existing AD accounts and names generated in the same run before any suffixing.
+- Users are enabled and their required department attributes validated immediately after creation.
+- Failures capture structured error metadata, and the report includes execution context (domain, forest, DC, operator, timestamp, PowerShell version, OS).
+- With `-RollbackCreatedAccountsOnFailure`, only accounts created by the current run are removed. See [Limitations](#limitations).
+
+## Default OU layout
 
 ```text
 Company
   Staff
-    IT
-      Users
-      Administrators
-    HR
-      Users
-      Administrators
-    Finance
-      Users
-      Administrators
-    Sales
+    IT / HR / Finance / Sales        (default departments)
       Users
       Administrators
 ```
 
-Employees are created in the department `Users` OU, while department administrator accounts are created in the department `Administrators` OU by default.
+Employees are created in each department's `Users` OU. Department administrator accounts (and their groups) are created in `Administrators` by default; pass `-CreateDepartmentAdministrators:$false` to skip them. Use `-Departments` and `-OrganizationalUnitName` to change the layout.
 
-## Role Model and Delegation
+## Delegation model
 
-The provisioning flow distinguishes between several administrative roles:
+| Role | Can | Cannot |
+| --- | --- | --- |
+| `Department-Administrators` | Create and delete users in their department `Users` OU; list and read user objects there | Broad property writes |
+| `Department-Attribute-Admins` | Reserved for explicitly reviewed attribute rights | Password reset, enable/disable, unlock, or anything else not individually granted |
+| Audit and report consumers | Read the JSONL log and reports | Should have read-only access |
 
-**`Department-Administrators`**
-- Create and delete users in the department `Users` OU
-- List and read user objects within the scoped OU
-- Support standard departmental lifecycle workflows
-- Do not receive broad property-write access by default
+Safeguards around delegation:
 
-**`Department-Attribute-Admins`**
-- Reserved for future explicit, reviewed delegation of specific user attributes
-- Do not automatically receive password-reset, enable/disable, unlock, or other privileged attribute-management rights
-- Should be granted only the exact rights needed for approved operations
-- Should not be treated as a generic catch-all admin group
+- Administrator groups are validated by expected name, location, security category, Global scope, and SID.
+- New delegation is granted only to a group **created during the current run**. A pre-existing group is accepted only if a SID-matched delegation ACE is already present.
 
-**Audit and report consumers**
-- Use the JSONL audit log and reporting scripts for visibility and evidence collection
-- Should operate with read-only access wherever possible
-
-This separation is intentional: the automation demonstrates tightly scoped user lifecycle delegation while keeping attribute changes explicit and auditable.
-
-## Core Usage Examples
-
-**Create users with a custom department list**
+## Common usage
 
 ```powershell
+# Custom departments
 .\mark42.ps1 -AccountCount 20 -Departments 'Engineering','Support','Operations'
-```
 
-**Use a custom names file**
+# Custom names file and OU name
+.\mark42.ps1 -NamesPath 'C:\Path\To\custom-names.txt' -OrganizationalUnitName '_LAB-USERS'
 
-```powershell
-.\mark42.ps1 -NamesPath 'C:\Path\To\custom-names.txt'
-```
-
-**Use a custom organizational unit name**
-
-```powershell
-.\mark42.ps1 -OrganizationalUnitName '_LAB-USERS'
-```
-
-**Supply a deterministic password pattern**
-
-```powershell
+# Deterministic password pattern
 .\mark42.ps1 -AccountCount 10 -PasswordPattern 'Training-{0}-Strong!'
-```
 
-**Supply a single secure password for all accounts**
-
-```powershell
+# One shared password for all accounts
 $securePassword = ConvertTo-SecureString 'Use-A-Strong-Lab-Password' -AsPlainText -Force
 .\mark42.ps1 -AccountCount 5 -Password $securePassword
-```
 
-**Export encrypted passwords to a custom path**
-
-```powershell
+# Opt in to an encrypted credential export
 .\mark42.ps1 -AccountCount 5 -ExportPasswords -PasswordFile '.\user-passwords.clixml'
 ```
 
-Credential export is opt-in and contains sensitive material. It is protected for the current Windows user context, but is not a general-purpose credential vault. If the target file already exists, provide `-OverwritePasswordFile` only when you intentionally want to replace it. Protect the file with restricted access and a clear retention policy.
+Random passwords are generated unless you supply a pattern or a password. Custom patterns are checked against the domain default policy and any readable fine-grained policy metadata before creation starts; final enforcement still happens at creation time.
 
-`-IncludePasswordInReport` is a separate, higher-risk option: it writes created passwords as plaintext into the CSV report. Do not use it for routine provisioning. If there is a specific approved need, strictly limit access to the report and securely remove or archive it immediately after use.
+## Script reference
 
-## Audit Logging
-
-The toolkit writes JSON Lines records to `AD-Operations.jsonl` by default. Each audit entry includes structured metadata such as:
-
-- Timestamp
-- Actor / Operator
-- Computer
-- Action
-- Target
-- Target Type
-- Status
-- Message
-- Details
-- Source
-- Correlation ID
-
-This structure supports operational review, incident response, and post-change analysis, and is consumed directly by `Script_AD_Audit_Report.ps1`.
-
-Lifecycle audit outcomes distinguish previews and declined confirmations from attempted changes. If a change was attempted but later verification or a subsequent step fails, the log may report `CompletedWithErrors`; inspect the target object before retrying because some changes may already have taken effect.
-
-## Security Notes
-
-### Password handling
-
-- Random passwords are generated by default
-- `-PasswordPattern` and `-AdministratorPasswordPattern` are used only when explicitly supplied
-- Custom password patterns are preflight-validated against the domain default policy and available fine-grained policy metadata before creation begins
-- Fine-grained password policies are discovered and summarized for visibility, but final validation still occurs during the AD creation operation
-- Credential export is disabled by default; use `-ExportPasswords` to opt in, optionally use `-PasswordFile <path>` to choose a destination, and use `-OverwritePasswordFile` only to intentionally replace an existing export
-- Password export material is written using `Export-Clixml` on Windows, staged with a restrictive ACL, and published only after staging succeeds
-- `mark42.ps1` also supports `-IncludePasswordInReport`, which writes plaintext passwords to the report CSV; this is distinct from the opt-in DPAPI-protected CLIXML export and should be avoided unless specifically approved
-- Saved password exports are sensitive and should be protected with strict access control and retention policies
-- Runtime audit logs and generated reports can contain operator, machine, account, and OU data; keep them local and access-controlled, and do not commit them
-
-### WhatIf and approval controls
-
-- `-WhatIf` is supported throughout the provisioning and lifecycle scripts
-- Destructive operations require explicit approval switches such as `-AllowDestructiveOperation`
-- Scripts that establish shared AD context restore it in `finally`, including when validation, lookups, or operations fail.
-- Attribute changes should be reviewed and granted through explicit allow-listed rights rather than broad delegated property writes
-- `-RollbackCreatedAccountsOnFailure` is intentionally scoped to account rollback only
-
-### Rollback scope and safety
-
-The provisioning script is designed for repeated lab runs and controlled AD automation. The built-in rollback switch removes only the accounts created by the current invocation. It does not remove existing OUs, groups, memberships, or delegated ACLs unless you explicitly perform a separate destructive reset.
-
-Account-level verification and group-membership failures do not stop the remaining batch when rollback is enabled. They are reported as partial failures, the affected account is removed, and remaining accounts continue processing. A failure outside an account-processing block can still abort the run and roll back any remaining accounts created by that invocation.
-
-The script also maintains an in-memory resource ledger that records each discovered or created object with `CreatedByThisRun = $true/$false`. This ledger underpins safer future cleanup logic: run-created resources may be removed, while pre-existing objects are never touched automatically.
-
-### Operational discipline
-
-- Review the domain, OU path, and naming before running live commands
-- Use dedicated test OUs for lab or portfolio scenarios
-- Keep audit logs in an access-controlled location with a documented retention schedule
-- Avoid storing plaintext credentials in scripts, command history, or shared folders
-
-## Administrative Script Catalog
-
-### User lifecycle
+**Provisioning and cleanup**
 
 | Script | Purpose |
 | --- | --- |
-| `Script_Disable_User.ps1` | Disable a user account |
-| `Script_Enable_User.ps1` | Enable a user account |
+| `mark42.ps1` | Bulk provisioning: OUs, groups, users, administrator accounts, CSV report |
+| `ActiveDirectory-Provisioner.ps1` | Core provisioner (requires `-PasswordFile` when exporting) |
+| `New_User_Script.ps1` | Create a single user with explicit attributes |
+| `Export-Test-Users.ps1` | CSV snapshot of generated users |
+| `Remove-Test-Users.ps1` | Lab cleanup entry point (wraps `2_RESET_TEST_USERS.ps1`) |
+| `2_RESET_TEST_USERS.ps1` | Removes generated users, department groups, and optionally the OU tree |
+
+**User lifecycle**
+
+| Script | Purpose |
+| --- | --- |
+| `Script_Enable_User.ps1` / `Script_Disable_User.ps1` | Enable or disable an account |
 | `Script_Move_User.ps1` | Move a user to a target OU |
-| `Script_Delete_User.ps1` | Delete a user account |
-| `Script_Terminate_User.ps1` | Disable a user and apply a termination reason, optionally moving the account |
+| `Script_Terminate_User.ps1` | Disable, optionally move, and record a termination reason |
+| `Script_Delete_User.ps1` | Delete an account (needs destructive approval) |
+| `Script_Disable_Inactive_Users.ps1` | Disable accounts inactive beyond a threshold |
 
-### Group and account management
+Termination keeps the existing description, avoids repeating the same dated note, refuses to exceed the AD description length limit, and verifies the final account state.
+
+**Groups and account health**
 
 | Script | Purpose |
 | --- | --- |
-| `Script_Add_User_to_Group.ps1` | Add a user to a group |
-| `Script_Remove_User_from_Group.ps1` | Remove a user from a group |
+| `Script_Add_User_to_Group.ps1` / `Script_Remove_User_from_Group.ps1` | Manage group membership |
 | `Script_Reset_User_Passwords.ps1` | Reset one or more passwords |
-| `Script_Unlock_User_Account.ps1` | Unlock a locked account |
-| `Script_Find_Locked-Out_Users.ps1` | Identify locked accounts and export results if needed |
+| `Script_Unlock_User_Account.ps1` | Unlock an account |
+| `Script_Find_Locked-Out_Users.ps1` | List locked accounts, optional CSV export |
 
-### Reporting and review
+**Reporting and tooling**
 
-| Script | Purpose |
+| Script / module | Purpose |
 | --- | --- |
-| `Script_AD_Audit_Report.ps1` | Summarize audit records and export filtered results |
-| `Script_AD_Security_Report.ps1` | Summarize security posture and targeted account conditions |
+| `Script_AD_Audit_Report.ps1` | Summarize and filter the audit log; export CSV or JSON |
+| `Script_AD_Security_Report.ps1` | Locked and inactive accounts, department coverage |
+| `AD-Operations.psm1` | Shared helpers: DC targeting, identity resolution, audit logging, CSV utilities |
+| `AD-Provisioning.psm1` | Provisioning logic and support functions |
+| `validate_repo.ps1` | Parser validation for every script and module |
+| `Tests\Run-OfflineTests.ps1` | Offline regression tests (no AD connection) |
+| `nigerian-names.txt` | Default name source for generated users |
 
-## Input File Format
+**Names file format:** one `First Surname` per line. Extra whitespace is tolerated, everything after the first token is treated as the surname, and blank or invalid lines are skipped with a warning.
 
-Each non-empty line in `nigerian-names.txt` should contain a first name and a surname:
+## Audit logging
 
-```text
-Chinedu Okafor
-Adaeze Nwosu
-Olumide Adeyemi
-```
+Records are written as JSON Lines to `AD-Operations.jsonl` by default, with these fields:
 
-The parser accepts extra whitespace and treats everything after the first whitespace-separated value as part of the surname. Blank or invalid lines are skipped with a warning.
-
-## Troubleshooting
-
-**Active Directory module is unavailable**
+`Timestamp`, `Actor`, `Computer`, `Action`, `Target`, `TargetType`, `Status`, `Message`, `Details`, `Source`, `CorrelationId`
 
 ```powershell
-Get-Module -ListAvailable ActiveDirectory
-Import-Module ActiveDirectory
+.\Script_AD_Audit_Report.ps1                                        # summary
+.\Script_AD_Audit_Report.ps1 -Identity 'chinedu.okafor'             # one identity
+.\Script_AD_Audit_Report.ps1 -Action 'CreateUser' -Status 'Failed'  # filtered
 ```
 
-**Access denied**
+Previews and declined confirmations are logged differently from attempted changes. If a change was attempted but a later verification or step failed, the status can be `CompletedWithErrors`. **Inspect the target object before retrying**, because part of the change may already have taken effect.
 
-Verify that the current account has the required delegated rights, and confirm that the target domain controller is reachable.
+## Security model
 
-**Names file not found**
+**Credentials**
 
-Use an absolute path with `-NamesPath`, or confirm that the file is present in the same directory as the script.
+- Credential export is **off by default**. Use `-ExportPasswords` to opt in; `mark42.ps1` then writes `user-passwords.clixml` beside the script unless you pass `-PasswordFile`.
+- Export requires Windows. The file is written with `Export-Clixml` (DPAPI, current user and machine), staged with a restrictive ACL, and published only after staging succeeds. Existing files are not replaced unless you pass `-OverwritePasswordFile`.
+- The export is not a credential vault. Restrict access and set a retention policy.
+- `-IncludePasswordInReport` writes **plaintext** passwords to the CSV. Avoid it except for a specifically approved need, and remove the report promptly.
+- Avoid plaintext credentials in scripts, shell history, or shared folders.
 
-**User creation fails**
+**Operational**
 
-Review the emitted warning or failure details. Common causes include:
+- Shared AD context is restored in `finally`, including when validation or lookups fail.
+- Audit logs and reports contain operator, machine, account, and OU data. Keep them local, access-controlled, and out of version control.
+- Use a dedicated test OU and confirm the domain, OU path, and naming before any live run.
 
-- Invalid naming or duplicate account collisions
-- Password-policy violations
-- Insufficient permissions
-- Domain reachability issues
-- Existing objects with conflicting identities
+## Testing
 
-## Cleanup and Reset
-
-Use `Remove-Test-Users.ps1` for the simplest lab cleanup flow. It wraps the existing removal logic in `2_RESET_TEST_USERS.ps1`, providing the same removal behavior with a clearer entry point.
-
-**Preview cleanup**
+Offline checks (no AD connection, no writes):
 
 ```powershell
+.\validate_repo.ps1            # parse every script and module
+.\Tests\Run-OfflineTests.ps1   # regression suite, prints pass/fail totals
+```
+
+The suite covers LDAP/DN escaping (including escaped commas), identity-not-found classification, termination descriptions, staged secure file publishing, opt-in credential export, secure-string cleanup, context cleanup, password generation and pattern parsing, name normalization, group validation, and SID-scoped delegation checks.
+
+**Not covered:** AD provider behavior, Windows ACL enforcement, permissions, replication, and live rollback. Verify those in an authorized lab with a writable DC and a dedicated test OU. `-WhatIf` can still run read-only AD queries, so it is not an offline simulation.
+
+## Limitations
+
+- **Rollback is account-only.** `-RollbackCreatedAccountsOnFailure` removes accounts created by the current run. It does not remove OUs, groups, memberships, or delegated ACLs.
+- **Partial failures continue.** With rollback enabled, an account-level verification or group-membership failure removes that account and the batch carries on. A failure outside account processing can still abort the run and roll back the remaining accounts from that invocation.
+- **Cleanup ledger is in memory.** Each object is recorded with `CreatedByThisRun = $true/$false`, which is the basis for safer future cleanup. Pre-existing objects are never touched automatically.
+- **`Department-Attribute-Admins` is a placeholder.** The group is created but granted no rights until you add reviewed, allow-listed ones.
+- **Windows only** for credential export and ACL handling.
+
+## Cleanup
+
+```powershell
+# Preview
 .\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
-```
 
-**Remove generated accounts**
-
-```powershell
+# Remove generated accounts
 .\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -AllowDestructiveOperation
-```
 
-**Remove the OU hierarchy as well**
-
-```powershell
+# ...and the OU hierarchy
 .\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -RemoveOrganizationalUnit -AllowDestructiveOperation
-```
 
-**Remove everything under the test OU**
-
-```powershell
+# ...or everything under the test OU
 .\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -DeleteEverything -AllowDestructiveOperation
 ```
 
-## Recommended Execution Flow
+## Troubleshooting
 
-```powershell
-Set-Location 'C:\Path\To\AD_PS-master'
-
-.\mark42.ps1 -AccountCount 10 -WhatIf
-.\mark42.ps1 -AccountCount 10
-
-.\Export-Test-Users.ps1 -OrganizationalUnitName 'Company'
-.\Script_AD_Audit_Report.ps1
-
-.\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
-.\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -AllowDestructiveOperation
-```
-
-This workflow provides a clear pattern for preview, execute, audit, and clean up.
-
-## Project Notes
-
-This repository is structured to demonstrate a credible Active Directory administration toolkit, with emphasis on:
-
-- Safe automation patterns
-- Operational transparency
-- Security-conscious defaults
-- Reusable PowerShell module design
-- Auditability and reviewability
-
-The code intentionally separates reusable AD helpers (`AD-Operations.psm1`, `AD-Provisioning.psm1`) from operation-specific scripts, making the project easier to extend and easier to present as a professional automation solution.
+| Symptom | What to check |
+| --- | --- |
+| AD module unavailable | `Get-Module -ListAvailable ActiveDirectory`, then install RSAT and `Import-Module ActiveDirectory` |
+| Access denied | The account's delegated rights and reachability of the target DC |
+| Names file not found | Use an absolute `-NamesPath`, or put the file beside the script |
+| User creation fails | Read the emitted failure details. Usual causes: naming collisions, password-policy violations, missing permissions, DC reachability, or conflicting existing objects |
 
 ## Disclaimer
 
-This toolkit performs real changes against Active Directory when run outside of `-WhatIf` mode, including account creation, password resets, group membership changes, and account deletion. Use it only in environments you are authorized to modify, and always:
+Outside `-WhatIf`, these scripts make real changes to Active Directory: creating accounts, resetting passwords, changing group membership, and deleting objects. Use them only where you are authorized, and always:
 
-1. Preview with `-WhatIf` first
-2. Validate against a small test batch
-3. Review the generated audit log
-4. Confirm the target domain, OU path, and naming before proceeding
-5. Follow your organization's change control and approval process for anything beyond a lab environment
+1. Preview with `-WhatIf`
+2. Test on a small batch
+3. Review the audit log
+4. Confirm the domain, OU path, and naming
+5. Follow change control for anything beyond a lab
 
-Start with preview mode, validate the expected behavior, and scale only after you're confident in the outcome.
+<!-- Add before publishing: a LICENSE file and badge, a short terminal screenshot or GIF of a -WhatIf run, and a sample audit report output. -->
