@@ -1,0 +1,43 @@
+# ── Secrets & sensitive local data ──────────────────────────────
+# Never commit real credentials, generated passwords, or exported
+# secrets from a live run against a real domain.
+.env
+.env.*
+*.secret
+*.secrets
+*.credential
+*.credentials
+*.pfx
+*.pem
+*.key
+user-passwords.clixml
+*password*.csv
+*password*.txt
+*_results.csv
+
+# ── Runtime output from these scripts ───────────────────────────
+# Audit logs and provisioning reports are generated locally each
+# run and can contain real usernames/OU paths — don't publish them.
+*.jsonl
+AD-Operations.jsonl
+AD-Provisioning-Report.csv
+*.log
+*.transcript
+PowerShell_transcript.*
+
+# ── Temp / backup files ──────────────────────────────────────────
+*.tmp
+*.temp
+*.bak
+*~
+
+# ── Editor / IDE ──────────────────────────────────────────────────
+.vscode/
+.vs/
+.idea/
+
+# ── OS cruft ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*
