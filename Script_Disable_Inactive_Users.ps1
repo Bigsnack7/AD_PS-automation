@@ -131,7 +131,7 @@ try {
         try {
             $operationDescription = if ($Identity) { 'Disable Active Directory account' } else { 'Disable inactive account' }
             if ($PSCmdlet.ShouldProcess($user.SamAccountName, $operationDescription)) {
-                Disable-ADAccount @adContext -Identity $user -ErrorAction Stop
+                Disable-ADAccount @adContext -Identity $user -Confirm:$false -ErrorAction Stop
                 $verifiedUser = Get-ADUser @adContext -Identity $user.SamAccountName -Properties Enabled -ErrorAction Stop
                 if ($verifiedUser.Enabled) {
                     throw "Disable verification failed for '$($user.SamAccountName)': the account is still enabled."

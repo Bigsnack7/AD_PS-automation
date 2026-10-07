@@ -35,6 +35,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 
@@ -83,4 +84,8 @@ else {
     $notProceedingStatus = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
     $notProceedingVerb = if ($WhatIfPreference) { 'Preview only: would enable' } else { 'Skipped: declined to enable' }
     Write-ADAuditRecord -Path $AuditLogPath -Action 'EnableUser' -Target $user.DistinguishedName -TargetType 'User' -Status $notProceedingStatus -Details "$notProceedingVerb user '$($user.SamAccountName)'."
+}
+}
+finally {
+    Clear-ADToolContext
 }

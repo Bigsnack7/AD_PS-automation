@@ -51,6 +51,28 @@ function Get-ADInvocationContext {
     return $context
 }
 
+function Get-UnbiasedRandomIndex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Cryptography.RandomNumberGenerator]$RandomNumberGenerator,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 256)]
+        [int]$MaxExclusive
+    )
+
+    if ($MaxExclusive -eq 1) { return 0 }
+
+    $limit = 256 - (256 % $MaxExclusive)
+    $buffer = New-Object byte[] 1
+    do {
+        $RandomNumberGenerator.GetBytes($buffer)
+    } while ([int]$buffer[0] -ge $limit)
+
+    return ([int]$buffer[0] % $MaxExclusive)
+}
+
 function New-RandomPassword {
     param(
         [ValidateRange(12, 256)]
@@ -59,27 +81,30 @@ function New-RandomPassword {
 
     $characterSet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%^&*()-_=+[]{};:,.<>?'
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    $bytes = New-Object byte[] $Length
-    $rng.GetBytes($bytes)
+    try {
+        $requiredCharacterSets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!@#$%^&*()-_=+[]{};:,.<>?')
+        $passwordChars = [System.Collections.Generic.List[char]]::new()
+        foreach ($requiredCharacterSet in $requiredCharacterSets) {
+            $index = Get-UnbiasedRandomIndex -RandomNumberGenerator $rng -MaxExclusive $requiredCharacterSet.Length
+            $passwordChars.Add($requiredCharacterSet[$index])
+        }
+        for ($index = $passwordChars.Count; $index -lt $Length; $index++) {
+            $characterIndex = Get-UnbiasedRandomIndex -RandomNumberGenerator $rng -MaxExclusive $characterSet.Length
+            $passwordChars.Add($characterSet[$characterIndex])
+        }
 
-    $requiredCharacterSets = @('ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!@#$%^&*()-_=+[]{};:,.<>?')
-    $passwordChars = [System.Collections.Generic.List[char]]::new()
-    foreach ($requiredCharacterSet in $requiredCharacterSets) {
-        $passwordChars.Add($requiredCharacterSet[$bytes[$passwordChars.Count] % $requiredCharacterSet.Length])
-    }
-    for ($index = $passwordChars.Count; $index -lt $Length; $index++) {
-        $passwordChars.Add($characterSet[$bytes[$index] % $characterSet.Length])
-    }
+        for ($index = $passwordChars.Count - 1; $index -gt 0; $index--) {
+            $swapIndex = Get-UnbiasedRandomIndex -RandomNumberGenerator $rng -MaxExclusive ($index + 1)
+            $temporaryCharacter = $passwordChars[$index]
+            $passwordChars[$index] = $passwordChars[$swapIndex]
+            $passwordChars[$swapIndex] = $temporaryCharacter
+        }
 
-    for ($index = $passwordChars.Count - 1; $index -gt 0; $index--) {
-        $swapIndex = $bytes[$index % $bytes.Length] % ($index + 1)
-        $temporaryCharacter = $passwordChars[$index]
-        $passwordChars[$index] = $passwordChars[$swapIndex]
-        $passwordChars[$swapIndex] = $temporaryCharacter
+        return -join $passwordChars
     }
-
-    $rng.Dispose()
-    return -join $passwordChars
+    finally {
+        $rng.Dispose()
+    }
 }
 
 function Test-PasswordComplexity {
@@ -129,6 +154,46 @@ function Resolve-PasswordPatternText {
     $usernameValue = if ([string]::IsNullOrWhiteSpace($Username)) { 'User01' } else { $Username }
     $tokenValue = if ([string]::IsNullOrWhiteSpace($Token)) { $formatValue } else { $Token }
     return $normalizedPattern -f $usernameValue, $tokenValue, $tokenValue
+}
+
+function Get-ADProvisioningPassword {
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$State,
+
+        [Parameter(Mandatory)]
+        [string]$Username,
+
+        [string]$PasswordPattern = '',
+
+        [string]$PasswordToken = ''
+    )
+
+    $effectivePattern = if (-not [string]::IsNullOrWhiteSpace($PasswordPattern)) {
+        $PasswordPattern
+    }
+    else {
+        $State.PasswordPattern
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($effectivePattern)) {
+        $passwordText = Resolve-PasswordPatternText -Pattern $effectivePattern -Username $Username -Token $PasswordToken
+        if ([string]::IsNullOrWhiteSpace($passwordText)) {
+            throw "Password pattern did not produce a password for '$Username'."
+        }
+        if (-not (Test-PasswordComplexity -PasswordText $passwordText)) {
+            throw "Password pattern for '$Username' does not meet the required character-category complexity."
+        }
+        return ConvertTo-SecureString -String $passwordText -AsPlainText -Force
+    }
+    if ($State.Password) {
+        return $State.Password
+    }
+    if ($State.WhatIf) {
+        return ConvertTo-SecureString -String 'WhatIf-Preview-Password-Not-Used' -AsPlainText -Force
+    }
+
+    throw "No password source is configured for '$Username'. Supply -Password or -PasswordPattern."
 }
 
 function Get-UniqueSamAccountName {
@@ -384,7 +449,7 @@ function Initialize-ADProvisioning {
     # a hardcoded, publicly-visible plaintext password ('WhatIf-Preview-Password-Not-Used') for
     # every account it created — despite the name saying it's for preview only. Fail fast
     # instead so real accounts are never created with a known password.
-    if (-not $WhatIf -and -not $Password) {
+    if (-not $WhatIf -and -not $Password -and [string]::IsNullOrWhiteSpace($PasswordPattern)) {
         throw 'A -Password (or a working -PasswordPattern) must be supplied for a live run. Refusing to fall back to a default password.'
     }
 
@@ -400,35 +465,34 @@ function Initialize-ADProvisioning {
 
     Import-Module $operationsModule -Force
     Assert-ADOperationsDependencies
-    $resolvedServer = Set-ADToolContext -Server $Server -Credential $Credential
-    $script:adContext = @{ Server = $resolvedServer }
-    if ($Credential) { $script:adContext.Credential = $Credential }
-    $aclDriveName = 'ADProvisioning'
-    if (Get-PSDrive -Name $aclDriveName -ErrorAction SilentlyContinue) {
-        Remove-PSDrive -Name $aclDriveName -Force -ErrorAction Stop
-    }
-    $aclDriveParameters = @{
-        Name = $aclDriveName
-        PSProvider = 'ActiveDirectory'
-        Root = '//RootDSE/'
-        Server = $resolvedServer
-    }
-    if ($Credential) { $aclDriveParameters.Credential = $Credential }
-    $null = New-PSDrive @aclDriveParameters -ErrorAction Stop
+    $aclDriveName = $null
+    try {
+        $resolvedServer = Set-ADToolContext -Server $Server -Credential $Credential
+        $script:adContext = @{ Server = $resolvedServer }
+        if ($Credential) { $script:adContext.Credential = $Credential }
+        $aclDriveName = "ADProvisioning_$([Guid]::NewGuid().ToString('N'))"
+        $aclDriveParameters = @{
+            Name = $aclDriveName
+            PSProvider = 'ActiveDirectory'
+            Root = '//RootDSE/'
+            Server = $resolvedServer
+        }
+        if ($Credential) { $aclDriveParameters.Credential = $Credential }
+        $null = New-PSDrive @aclDriveParameters -ErrorAction Stop
 
-    $domain = Get-ADDomain @script:adContext -ErrorAction Stop
-    $forest = Get-ADForest @script:adContext -ErrorAction Stop
-    $executionContext = [pscustomobject]@{
-        Domain = $domain.DNSRoot
-        Forest = $forest.Name
-        DC = $resolvedServer
-        DomainController = $resolvedServer
-        User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        ExecutionTime = (Get-Date).ToUniversalTime().ToString('o')
-        PowerShellVersion = $PSVersionTable.PSVersion.ToString()
-        OS = [System.Environment]::OSVersion.VersionString
-    }
-    $state = [pscustomobject]@{
+        $domain = Get-ADDomain @script:adContext -ErrorAction Stop
+        $forest = Get-ADForest @script:adContext -ErrorAction Stop
+        $executionContext = [pscustomobject]@{
+            Domain = $domain.DNSRoot
+            Forest = $forest.Name
+            DC = $resolvedServer
+            DomainController = $resolvedServer
+            User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+            ExecutionTime = (Get-Date).ToUniversalTime().ToString('o')
+            PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+            OS = [System.Environment]::OSVersion.VersionString
+        }
+        $state = [pscustomobject]@{
         ScriptDirectory = $scriptDirectory
         Departments = $resolvedDepartments
         OrganizationalUnitName = $OrganizationalUnitName
@@ -462,13 +526,31 @@ function Initialize-ADProvisioning {
         DepartmentAdministratorOUs = @{}
         DepartmentUserGroups = @{}
         DepartmentAdministratorGroups = @{}
+        DepartmentAdministratorGroupCreatedByThisRun = @{}
         DepartmentAttributeAdministratorGroups = @{}
         CreatedAccounts = [System.Collections.Generic.List[psobject]]::new()
         ReportRecords = [System.Collections.Generic.List[psobject]]::new()
         PasswordRecords = [System.Collections.Generic.List[psobject]]::new()
-    }
+        }
 
-    return $state
+        return $state
+    }
+    catch {
+        if ($aclDriveName -and (Get-PSDrive -Name $aclDriveName -ErrorAction SilentlyContinue)) {
+            try {
+                Remove-PSDrive -Name $aclDriveName -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Failed to remove temporary AD drive '$aclDriveName' after initialization failed: $($_.Exception.Message)"
+            }
+        }
+        Clear-ADToolContext
+        throw
+    }
+}
+
+function Clear-ADProvisioningContext {
+    Clear-ADToolContext
 }
 
 function Test-ADProvisioningPreflight {
@@ -796,37 +878,74 @@ function New-DepartmentGroups {
         try {
             return @(Get-ADGroup @script:adContext -LDAPFilter $Filter -SearchBase $DepartmentOU -SearchScope OneLevel -ErrorAction Stop)
         }
-        catch {
+        catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
             if ($State.WhatIf) { return @() }
+            throw
+        }
+        catch {
             throw
         }
     }
 
+    $userGroupCreatedByThisRun = $false
+    $adminGroupCreatedByThisRun = $false
+    $attributeAdminGroupCreatedByThisRun = $false
+
     $userGroup = Find-ExistingGroup -Filter $userGroupFilter
+    if ($userGroup.Count -gt 1) {
+        throw "More than one group named '$userGroupName' was found under '$DepartmentOU'."
+    }
     if ($userGroup.Count -eq 0) {
         if (-not $State.WhatIf) {
-            $userGroup = @(New-ADGroup @script:adContext -Name $userGroupName -GroupScope Global -GroupCategory Security -Path $DepartmentOU -PassThru)
+            $createdGroup = New-ADGroup @script:adContext -Name $userGroupName -GroupScope Global -GroupCategory Security -Path $DepartmentOU -PassThru -ErrorAction Stop
+            $userGroup = @(Get-ADGroup @script:adContext -Identity $createdGroup.DistinguishedName -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
+            $userGroupCreatedByThisRun = $true
         }
+    }
+    else {
+        $userGroup = @(Get-ADGroup @script:adContext -Identity $userGroup[0].DistinguishedName -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
     }
 
     $adminGroup = Find-ExistingGroup -Filter $adminGroupFilter
+    if ($adminGroup.Count -gt 1) {
+        throw "More than one administrator group named '$adminGroupName' was found under '$DepartmentOU'."
+    }
     if ($adminGroup.Count -eq 0) {
         if (-not $State.WhatIf) {
-            $adminGroup = @(New-ADGroup @script:adContext -Name $adminGroupName -GroupScope Global -GroupCategory Security -Path $DepartmentOU -PassThru)
+            $createdGroup = New-ADGroup @script:adContext -Name $adminGroupName -GroupScope Global -GroupCategory Security -Path $DepartmentOU -PassThru -ErrorAction Stop
+            $adminGroup = @(Get-ADGroup @script:adContext -Identity $createdGroup.DistinguishedName -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
+            $adminGroupCreatedByThisRun = $true
         }
+    }
+    else {
+        $adminGroup = @(Get-ADGroup @script:adContext -Identity $adminGroup[0].DistinguishedName -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
+    }
+    if (-not $State.WhatIf -and $adminGroup.Count -eq 1) {
+        $null = Get-ADValidatedSecurityGroupSid -Group $adminGroup[0] -ExpectedName $adminGroupName -ExpectedParentDistinguishedName $DepartmentOU
     }
 
     $attributeAdminGroup = Find-ExistingGroup -Filter $attributeAdminGroupFilter
+    if ($attributeAdminGroup.Count -gt 1) {
+        throw "More than one attribute-administrator group named '$attributeAdminGroupName' was found under '$DepartmentOU'."
+    }
     if ($attributeAdminGroup.Count -eq 0) {
         if (-not $State.WhatIf) {
-            $attributeAdminGroup = @(New-ADGroup @script:adContext -Name $attributeAdminGroupName -GroupScope Global -GroupCategory Security -Path $DepartmentOU -PassThru)
+            $createdGroup = New-ADGroup @script:adContext -Name $attributeAdminGroupName -GroupScope Global -GroupCategory Security -Path $DepartmentOU -PassThru -ErrorAction Stop
+            $attributeAdminGroup = @(Get-ADGroup @script:adContext -Identity $createdGroup.DistinguishedName -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
+            $attributeAdminGroupCreatedByThisRun = $true
         }
+    }
+    else {
+        $attributeAdminGroup = @(Get-ADGroup @script:adContext -Identity $attributeAdminGroup[0].DistinguishedName -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
     }
 
     return [pscustomobject]@{
         UserGroup = if ($userGroup.Count -gt 0) { $userGroup[0] } else { $null }
+        UserGroupCreatedByThisRun = $userGroupCreatedByThisRun
         AdministratorGroup = if ($adminGroup.Count -gt 0) { $adminGroup[0] } else { $null }
+        AdministratorGroupCreatedByThisRun = $adminGroupCreatedByThisRun
         AttributeAdministratorGroup = if ($attributeAdminGroup.Count -gt 0) { $attributeAdminGroup[0] } else { $null }
+        AttributeAdministratorGroupCreatedByThisRun = $attributeAdminGroupCreatedByThisRun
     }
 }
 
@@ -845,20 +964,21 @@ function New-DepartmentUser {
         [Parameter(Mandatory)]
         [string]$Username,
 
+        [string]$GivenName = '',
+
+        [string]$Surname = 'User',
+
         [string]$PasswordPattern,
 
         [string]$PasswordToken = ''
     )
 
-    # BUGFIX: previously fell back to the hardcoded plaintext password
-    # 'WhatIf-Preview-Password-Not-Used' for REAL account creation whenever $State.Password was
-    # unset — Initialize-ADProvisioning now refuses to build state for a live run without a
-    # password, so by the time we get here in live mode $State.Password is guaranteed to be
-    # set. WhatIf mode still uses a clearly-labelled dummy value since no account is created.
-    $password = if ($State.Password) { $State.Password } else { (ConvertTo-SecureString 'WhatIf-Preview-Password-Not-Used' -AsPlainText -Force) }
+    $password = Get-ADProvisioningPassword -State $State -Username $Username -PasswordPattern $PasswordPattern -PasswordToken $PasswordToken
+    $effectiveGivenName = if ([string]::IsNullOrWhiteSpace($GivenName)) { $Department } else { $GivenName }
+    $effectiveSurname = if ([string]::IsNullOrWhiteSpace($Surname)) { 'User' } else { $Surname }
 
     if (-not $State.WhatIf) {
-        $createdUser = New-ADUser @script:adContext -SamAccountName $Username -UserPrincipalName "$Username@$($State.EffectiveUPNSuffix)" -AccountPassword $password -GivenName $Department -Surname 'User' -DisplayName "$Department User" -Name $Username -Department $Department -Path $TargetOuDistinguishedName -Enabled (-not $State.EnableAccountsAfterVerification) -PassThru -ErrorAction Stop
+        $createdUser = New-ADUser @script:adContext -SamAccountName $Username -UserPrincipalName "$Username@$($State.EffectiveUPNSuffix)" -AccountPassword $password -GivenName $effectiveGivenName -Surname $effectiveSurname -DisplayName "$effectiveGivenName $effectiveSurname" -Name $Username -Department $Department -Path $TargetOuDistinguishedName -Enabled (-not $State.EnableAccountsAfterVerification) -PassThru -ErrorAction Stop
         return [pscustomobject]@{ User = $createdUser; Created = $true }
     }
 
@@ -920,8 +1040,16 @@ function New-DepartmentAdministrator {
         [string]$PasswordToken = ''
     )
 
-    # BUGFIX: same demo-password fallback issue as New-DepartmentUser; see notes there.
-    $password = if ($State.Password) { $State.Password } else { (ConvertTo-SecureString 'WhatIf-Preview-Password-Not-Used' -AsPlainText -Force) }
+    $effectivePasswordPattern = if (-not [string]::IsNullOrWhiteSpace($PasswordPattern)) {
+        $PasswordPattern
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($State.AdministratorPasswordPattern)) {
+        $State.AdministratorPasswordPattern
+    }
+    else {
+        $State.PasswordPattern
+    }
+    $password = Get-ADProvisioningPassword -State $State -Username $Username -PasswordPattern $effectivePasswordPattern -PasswordToken $PasswordToken
 
     if (-not $State.WhatIf) {
         $createdAdmin = New-ADUser @script:adContext -SamAccountName $Username -UserPrincipalName "$Username@$($State.EffectiveUPNSuffix)" -AccountPassword $password -GivenName ($Department.ToUpperInvariant() + 'Admin') -Surname 'Administrator' -DisplayName "$Department Administrator" -Name $Username -Department $Department -Path $TargetOuDistinguishedName -Enabled (-not $State.EnableAccountsAfterVerification) -PassThru -ErrorAction Stop
@@ -937,8 +1065,17 @@ function Set-DepartmentDelegation {
         [Parameter(Mandatory)]
         [psobject]$State,
 
+        [AllowNull()]
+        [psobject]$Group,
+
         [Parameter(Mandatory)]
         [string]$GroupName,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedGroupParentDistinguishedName,
+
+        [Parameter(Mandatory)]
+        [bool]$CreatedByThisRun,
 
         [Parameter(Mandatory)]
         [string]$TargetOuDistinguishedName,
@@ -946,11 +1083,6 @@ function Set-DepartmentDelegation {
         [string]$DomainNetBIOSName = ''
     )
 
-    $groupIdentityValue = if ($DomainNetBIOSName) { "$DomainNetBIOSName\$GroupName" } else { $GroupName }
-    # BUGFIX: an identical NTAccount object used to be built twice under two different variable
-    # names ($groupIdentity here, $identity further down) — the first was computed and never
-    # used. Build it once and reuse it.
-    $groupIdentity = [System.Security.Principal.NTAccount]::new($groupIdentityValue)
     $ouPath = "$($State.AclDriveName):\$TargetOuDistinguishedName"
 
     $userClassGuid = [System.Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
@@ -965,28 +1097,18 @@ function Set-DepartmentDelegation {
         return [pscustomobject]@{ GroupName = $GroupName; TargetOuDistinguishedName = $TargetOuDistinguishedName; Status = 'Preview' }
     }
 
-    $acl = Get-Acl -Path $ouPath
-    $groupAllowRules = @(
-        $acl.Access | Where-Object {
-            $_.IdentityReference.Value -ieq $groupIdentityValue -and
-            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
-        }
-    )
-
-    $alreadyGranted = $groupAllowRules | Where-Object {
-        $_.ObjectType -eq $userClassGuid -and
-        $_.InheritedObjectType -eq $userClassGuid -and
-        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
-        ($_.ActiveDirectoryRights -band $managedAccessRights) -eq $managedAccessRights
-    }
+    $groupSid = Get-ADValidatedSecurityGroupSid -Group $Group -ExpectedName $GroupName -ExpectedParentDistinguishedName $ExpectedGroupParentDistinguishedName
+    $acl = Get-Acl -Path $ouPath -ErrorAction Stop
+    $alreadyGranted = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
+    Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun -ExistingDelegation $alreadyGranted
 
     if ($alreadyGranted) {
         return [pscustomobject]@{ GroupName = $GroupName; TargetOuDistinguishedName = $TargetOuDistinguishedName; Status = 'AlreadyPresent' }
     }
 
-    $accessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($groupIdentity, $managedAccessRights, 'Allow', $userClassGuid, [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents, $userClassGuid)
+    $accessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($groupSid, $managedAccessRights, 'Allow', $userClassGuid, [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents, $userClassGuid)
     $acl.AddAccessRule($accessRule)
-    Set-Acl -Path $ouPath -AclObject $acl
+    Set-Acl -Path $ouPath -AclObject $acl -ErrorAction Stop
 
     return [pscustomobject]@{ GroupName = $GroupName; TargetOuDistinguishedName = $TargetOuDistinguishedName; Status = 'Granted' }
 }
@@ -1094,4 +1216,4 @@ function Invoke-ProvisioningRollback {
     return [pscustomobject]@{ RolledBack = $true; AccountsRemoved = $State.CreatedAccounts.Count }
 }
 
-Export-ModuleMember -Function 'Test-DepartmentNames', 'Get-ADInvocationContext', 'New-RandomPassword', 'Test-PasswordComplexity', 'Resolve-PasswordPatternText', 'Get-UniqueSamAccountName', 'Get-ADFailureCategory', 'Get-ADCreateFailureDetails', 'Initialize-ADProvisioning', 'Test-ADProvisioningPreflight', 'Test-ADProvisioningTargetPermissions', 'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser', 'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation', 'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback'
+Export-ModuleMember -Function 'Test-DepartmentNames', 'Get-ADInvocationContext', 'New-RandomPassword', 'Test-PasswordComplexity', 'Resolve-PasswordPatternText', 'Get-UniqueSamAccountName', 'Get-ADFailureCategory', 'Get-ADCreateFailureDetails', 'Initialize-ADProvisioning', 'Clear-ADProvisioningContext', 'Test-ADProvisioningPreflight', 'Test-ADProvisioningTargetPermissions', 'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser', 'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation', 'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback'

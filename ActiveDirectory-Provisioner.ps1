@@ -179,10 +179,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
-trap {
-    Clear-ADToolContext
-    throw $_
-}
+try {
 $resolvedServer = Set-ADToolContext -Server $Server -Credential $Credential
 
 function Invoke-ADPreflight {
@@ -344,36 +341,32 @@ function Invoke-ADPreflight {
 
             if (-not [string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName) -and -not [string]::IsNullOrWhiteSpace($departmentAdministratorsOuDistinguishedName)) {
                 Write-Verbose "[Preflight breadcrumb] Entering ACL/delegation check for '$department' on '$departmentUserOuDistinguishedName'."
-                $groupIdentityValue = if ($DomainNetBIOSName) { "$DomainNetBIOSName\${department}-Administrators" } else { "${department}-Administrators" }
-                $userClassGuid = [System.Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
-                $managedAccessRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
-                    [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild -bor
-                    [System.DirectoryServices.ActiveDirectoryRights]::ListChildren -bor
-                    [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
-                    [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
-                    [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
+                $adminGroupName = "${department}-Administrators"
+                $safeAdminGroupName = ConvertTo-LdapFilterValue $adminGroupName
+                $adminGroups = @(Get-ADGroup @adContext -LDAPFilter "(cn=$safeAdminGroupName)" `
+                    -SearchBase $departmentAdministratorsOuDistinguishedName -SearchScope OneLevel `
+                    -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
+                if ($adminGroups.Count -gt 1) {
+                    throw "More than one administrator group named '$adminGroupName' was found below '$departmentAdministratorsOuDistinguishedName'."
+                }
 
-                $acl = Get-Acl -Path "AD:\$departmentUserOuDistinguishedName"
-                Write-Verbose "[Preflight breadcrumb] Get-Acl succeeded for '$department'. Access entry count: $(@($acl.Access).Count)."
-                $groupAllowRules = @($acl.Access | Where-Object {
-                        $_.IdentityReference.Value -ieq $groupIdentityValue -and
-                        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
-                    })
-                Write-Verbose "[Preflight breadcrumb] Filtered ACL rules for '$department'. Matching rule count: $($groupAllowRules.Count)."
-
-                $alreadyGranted = $groupAllowRules | Where-Object {
-                        $_.ObjectType -eq $userClassGuid -and
-                        $_.InheritedObjectType -eq $userClassGuid -and
-                        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
-                        ($_.ActiveDirectoryRights -band $managedAccessRights) -eq $managedAccessRights
-                    }
-
-                $delegationStatus = if ($alreadyGranted) { 'Passed' } else { 'NeedsAttention' }
-                $delegationDetails = if ($alreadyGranted) {
-                    "Delegation for '${department}-Administrators' on '$departmentUserOuDistinguishedName' is already present and correct."
+                if ($adminGroups.Count -eq 0) {
+                    $delegationStatus = 'NeedsAttention'
+                    $delegationDetails = "Administrator group '$adminGroupName' will be created during provisioning; delegation will be scoped to that newly created group's SID."
                 }
                 else {
-                    "Delegation for '${department}-Administrators' on '$departmentUserOuDistinguishedName' is not yet present and will be granted during Phase 2."
+                    $groupSid = Get-ADValidatedSecurityGroupSid -Group $adminGroups[0] `
+                        -ExpectedName $adminGroupName `
+                        -ExpectedParentDistinguishedName $departmentAdministratorsOuDistinguishedName
+                    $acl = Get-Acl -Path "AD:\$departmentUserOuDistinguishedName" -ErrorAction Stop
+                    $alreadyGranted = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
+                    $delegationStatus = if ($alreadyGranted) { 'Passed' } else { 'Failed' }
+                    $delegationDetails = if ($alreadyGranted) {
+                        "Delegation for '$adminGroupName' on '$departmentUserOuDistinguishedName' is already present for the validated group SID."
+                    }
+                    else {
+                        "Pre-existing administrator group '$adminGroupName' has no matching SID-scoped delegation on '$departmentUserOuDistinguishedName'; automatic delegation is refused."
+                    }
                 }
 
                 Add-PreflightCheck -Name "Delegation state: $department" -Status $delegationStatus -Details $delegationDetails
@@ -520,7 +513,7 @@ function Protect-PasswordExportFile {
     $acl = Get-Acl -LiteralPath $Path
     $currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     if ($null -eq $currentIdentity -or $null -eq $currentIdentity.User) {
-        return
+        throw 'Could not determine the current Windows identity to secure the password export file.'
     }
 
     $currentUser = $currentIdentity.User.Value
@@ -541,6 +534,49 @@ function Protect-PasswordExportFile {
 
     $acl.AddAccessRule($fullControlRule)
     Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Export-PasswordRecordsSecurely {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.Generic.List[psobject]]$Records,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [switch]$Overwrite
+    )
+
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        throw 'DPAPI-protected credential exports require Windows. Refusing to write credential material on this platform.'
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $directory = [System.IO.Path]::GetDirectoryName($fullPath)
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        $null = New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop
+    }
+
+    $fileName = [System.IO.Path]::GetFileNameWithoutExtension($fullPath)
+    $stagingPath = Join-Path $directory ".$fileName.$([Guid]::NewGuid().ToString('N')).tmp.clixml"
+    try {
+        $null = New-Item -ItemType File -Path $stagingPath -ErrorAction Stop
+        Protect-PasswordExportFile -Path $stagingPath
+        $Records | Export-Clixml -LiteralPath $stagingPath -Force -ErrorAction Stop
+        Move-ADSecuredFileIntoPlace -StagingPath $stagingPath -DestinationPath $fullPath -Overwrite:$Overwrite
+    }
+    finally {
+        if (Test-Path -LiteralPath $stagingPath -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $stagingPath -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Failed to remove sensitive staging file '$stagingPath': $($_.Exception.Message)"
+            }
+        }
+    }
 }
 
 $adContext = Get-ADInvocationContext -Server $resolvedServer -Credential $Credential
@@ -1134,13 +1170,14 @@ function Test-ADProvisionedUser {
 
 function Grant-DepartmentUserDelegation {
     param(
+        [Parameter(Mandatory)][psobject]$Group,
         [Parameter(Mandatory)][string]$GroupName,
+        [Parameter(Mandatory)][string]$ExpectedGroupParentDistinguishedName,
+        [Parameter(Mandatory)][bool]$CreatedByThisRun,
         [Parameter(Mandatory)][string]$TargetOuDistinguishedName,
         [string]$DomainNetBIOSName = ''
     )
 
-    $groupIdentityValue = if ($DomainNetBIOSName) { "$DomainNetBIOSName\$GroupName" } else { $GroupName }
-    $groupIdentity = [System.Security.Principal.NTAccount]::new($groupIdentityValue)
     $ouPath = "AD:\$TargetOuDistinguishedName"
 
     # Scoped OU delegation for the department user-object lifecycle role.
@@ -1170,21 +1207,10 @@ function Grant-DepartmentUserDelegation {
         return
     }
 
-    $acl = Get-Acl -Path $ouPath
-    $groupAllowRules = @(
-        $acl.Access |
-            Where-Object {
-                $_.IdentityReference.Value -ieq $groupIdentityValue -and
-                $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
-            }
-    )
-
-    $alreadyGranted = $groupAllowRules | Where-Object {
-        $_.ObjectType -eq $userClassGuid -and
-        $_.InheritedObjectType -eq $userClassGuid -and
-        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
-        ($_.ActiveDirectoryRights -band $managedAccessRights) -eq $managedAccessRights
-    }
+    $groupSid = Get-ADValidatedSecurityGroupSid -Group $Group -ExpectedName $GroupName -ExpectedParentDistinguishedName $ExpectedGroupParentDistinguishedName
+    $acl = Get-Acl -Path $ouPath -ErrorAction Stop
+    $alreadyGranted = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
+    Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun -ExistingDelegation $alreadyGranted
 
     if ($alreadyGranted) {
         Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName -CreatedByThisRun $false
@@ -1193,7 +1219,7 @@ function Grant-DepartmentUserDelegation {
     }
 
     $accessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-        $groupIdentity,
+        $groupSid,
         $managedAccessRights,
         [System.Security.AccessControl.AccessControlType]::Allow,
         $userClassGuid,
@@ -1202,7 +1228,7 @@ function Grant-DepartmentUserDelegation {
     )
 
     $acl.AddAccessRule($accessRule)
-    Set-Acl -Path $ouPath -AclObject $acl
+    Set-Acl -Path $ouPath -AclObject $acl -ErrorAction Stop
     Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName -CreatedByThisRun $true
     Write-ADProvisioningAuditRecord -Action 'GrantDelegation' -Target $GroupName -TargetType 'Delegation' -Status 'Succeeded' -Details "Granted scoped user-object lifecycle delegation to '$GroupName' on '$TargetOuDistinguishedName'."
     Write-Host "Delegated scoped user-object lifecycle rights to '$GroupName' on '$TargetOuDistinguishedName' (create/list/read/delete only; explicit attribute/control rights are intentionally excluded)." -ForegroundColor Yellow
@@ -1360,12 +1386,13 @@ foreach ($department in $Departments) {
 
         $departmentAdministratorGroupName = "${department}-Administrators"
         $safeDepartmentAdministratorGroupName = ConvertTo-LdapFilterValue $departmentAdministratorGroupName
+        $departmentAdministratorGroupCreatedByThisRun = $false
 
         $departmentAdministratorGroup = @(if (Test-SimulatedResource $departmentAdministratorsOU) {
             @()
         }
         else {
-            @(Get-ADGroup @adContext -LDAPFilter "(cn=$safeDepartmentAdministratorGroupName)" `
+            @(Get-ADGroup @adContext -LDAPFilter "(cn=$safeDepartmentAdministratorGroupName)" -Properties SID,GroupScope,GroupCategory `
                 -SearchBase $departmentAdministratorsOU.DistinguishedName -SearchScope OneLevel -ErrorAction Stop
             )
         })
@@ -1384,8 +1411,11 @@ foreach ($department in $Departments) {
                 $departmentAdministratorGroup = New-SimulatedGroup -Name $departmentAdministratorGroupName -ParentDistinguishedName $departmentAdministratorsOU.DistinguishedName
             }
             else {
-                $departmentAdministratorGroup = New-ADGroup @adContext -Name $departmentAdministratorGroupName `
-                    -GroupScope Global -GroupCategory Security -Path $departmentAdministratorsOU.DistinguishedName -PassThru
+                $createdAdministratorGroup = New-ADGroup @adContext -Name $departmentAdministratorGroupName `
+                    -GroupScope Global -GroupCategory Security -Path $departmentAdministratorsOU.DistinguishedName -PassThru -ErrorAction Stop
+                $departmentAdministratorGroup = Get-ADGroup @adContext -Identity $createdAdministratorGroup.DistinguishedName `
+                    -Properties SID,GroupScope,GroupCategory -ErrorAction Stop
+                $departmentAdministratorGroupCreatedByThisRun = $true
                 Add-ResourceLedgerEntry -Type 'Group' -DistinguishedName $departmentAdministratorGroup.DistinguishedName -Name $departmentAdministratorGroupName -CreatedByThisRun $true
                 Write-ADProvisioningAuditRecord -Action 'CreateGroup' -Target $departmentAdministratorGroup.DistinguishedName -TargetType 'Group' -Status 'Succeeded' -Details "Created department administrator group '$departmentAdministratorGroupName' in '$($departmentAdministratorsOU.DistinguishedName)'."
             }
@@ -1437,7 +1467,11 @@ foreach ($department in $Departments) {
         $departmentAttributeAdministratorGroups[$department] = @($departmentAttributeAdministratorGroup)[0]
 
         if (-not $AdministratorsOnly) {
-            Grant-DepartmentUserDelegation -GroupName $departmentAdministratorGroupName -TargetOuDistinguishedName $departmentUserOUs[$department] -DomainNetBIOSName $domainNetBIOSName
+            Grant-DepartmentUserDelegation -Group $departmentAdministratorGroups[$department] `
+                -GroupName $departmentAdministratorGroupName `
+                -ExpectedGroupParentDistinguishedName $departmentAdministratorsOU.DistinguishedName `
+                -CreatedByThisRun $departmentAdministratorGroupCreatedByThisRun `
+                -TargetOuDistinguishedName $departmentUserOUs[$department] -DomainNetBIOSName $domainNetBIOSName
             Write-DepartmentAttributeDelegationNotice -GroupName $departmentAttributeAdministratorGroupName -TargetOuDistinguishedName $departmentUserOUs[$department]
         }
     }
@@ -1991,15 +2025,14 @@ catch {
 
 Write-Progress -Activity 'Creating Active Directory users' -Completed
 if (-not $WhatIfPreference -and $ExportPasswords -and $PasswordFile -and $passwordRecords.Count -gt 0) {
-    $passwordFileExistedBeforeExport = Test-Path -LiteralPath $PasswordFile -PathType Leaf
     try {
         Write-Warning "Credential export requested. '$PasswordFile' contains DPAPI-protected credential material for the accounts created in this run. This is scoped to the current Windows user/machine context and is not a general-purpose encrypted password vault. Protect the file and limit access to authorized administrators only."
-        $passwordRecords | Export-Clixml -LiteralPath $PasswordFile -Force
-        Protect-PasswordExportFile -Path $PasswordFile
+        Export-PasswordRecordsSecurely -Records $passwordRecords -Path $PasswordFile -Overwrite:$OverwritePasswordFile
         Write-Host "DPAPI-protected credential material saved to: $PasswordFile (intended for the same Windows user/machine context)." -ForegroundColor Yellow
     }
     catch {
-        Write-Error "Credential export failed: $($_.Exception.Message)"
+        $exportError = $_
+        Write-Warning "Credential export failed: $($exportError.Exception.Message)"
         if ($RollbackCreatedAccountsOnFailure) {
             Write-Host 'Account rollback is enabled. Removing accounts because credential export did not complete.' -ForegroundColor Yellow
             Invoke-AccountRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
@@ -2007,11 +2040,8 @@ if (-not $WhatIfPreference -and $ExportPasswords -and $PasswordFile -and $passwo
         else {
             Write-Host 'Account rollback is not enabled. Created accounts were retained after credential export failed.' -ForegroundColor DarkGray
         }
-        if (-not $passwordFileExistedBeforeExport -and (Test-Path -LiteralPath $PasswordFile -PathType Leaf)) {
-            Remove-Item -LiteralPath $PasswordFile -Force -ErrorAction SilentlyContinue
-        }
         Write-ADProvisioningReport -OutputPath $ReportPath -Records $reportRecords
-        throw
+        throw $exportError
     }
 }
 
@@ -2069,4 +2099,7 @@ $summaryLines = @(
 Write-Host ($summaryLines -join [Environment]::NewLine) -ForegroundColor Green
 Write-ADProvisioningReport -OutputPath $ReportPath -Records $reportRecords
 Write-Host "Completed. Created: $createdCount; Failed: $failedCount; Skipped: $skippedCount; Requested: $requestedAccountCount; Available names used: $AccountCount; Departments: $($Departments -join ', ')" -ForegroundColor Green
-Clear-ADToolContext
+}
+finally {
+    Clear-ADToolContext
+}

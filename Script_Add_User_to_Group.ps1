@@ -40,6 +40,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 
@@ -85,4 +86,8 @@ else {
     $notProceedingStatus = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
     $notProceedingVerb = if ($WhatIfPreference) { 'Preview only: would add' } else { 'Skipped: declined to add' }
     Write-ADAuditRecord -Path $AuditLogPath -Action 'AddGroupMember' -Target $target -TargetType 'GroupMembership' -Status $notProceedingStatus -Details "$notProceedingVerb user '$($user.SamAccountName)' to group '$($group.Name)'."
+}
+}
+finally {
+    Clear-ADToolContext
 }

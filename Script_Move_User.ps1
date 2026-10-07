@@ -40,6 +40,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 $user = Resolve-ADIdentitySafe $Identity -Server $Server -Credential $Credential
@@ -55,34 +56,21 @@ if (-not $user) {
 $targetOu = Get-TargetOU -Path $TargetPath -Server $Server -Credential $Credential
 $target = "$($user.DistinguishedName) -> $($targetOu.DistinguishedName)"
 
-# BUGFIX: "is the user already in the target OU" was decided with
-# $user.DistinguishedName.EndsWith(",$($targetOu.DistinguishedName)"). EndsWith on a raw DN
-# string is a substring check, not a parent-container check — a user one or more sub-OUs BELOW
-# the target (e.g. user in "OU=Sub,OU=IT,...", target "OU=IT,...") has a DN that legitimately
-# ends with ",OU=IT,..." too, so they were wrongly reported as "already in the target OU" and
-# the move was silently skipped. The same broken comparison was reused to verify the move
-# afterward, so it could also report success when the object actually landed one level deeper
-# than intended. Compare the user's *immediate* parent DN for an exact match instead.
-function Get-ParentDistinguishedName {
-    param([Parameter(Mandatory)][string]$DistinguishedName)
-    # Strips the leading RDN (e.g. "CN=Jane Doe,") while respecting backslash-escaped
-    # characters (including escaped commas) inside that RDN's value.
-    return ($DistinguishedName -replace '^(?:[^,\\]|\\.)*,', '')
-}
-
-$userParentDn = Get-ParentDistinguishedName -DistinguishedName $user.DistinguishedName
+$userParentDn = Get-ADDistinguishedNameParent -DistinguishedName $user.DistinguishedName
 if ($userParentDn.Equals($targetOu.DistinguishedName, [StringComparison]::OrdinalIgnoreCase)) {
     Write-ADAuditRecord -Path $AuditLogPath -Action 'MoveUser' -Target $target -TargetType 'User' -Status 'Skipped' -Message 'User is already in the target OU.' -Details "User '$($user.SamAccountName)' is already located in OU '$($targetOu.DistinguishedName)'."
     Write-Host "User $($user.SamAccountName) is already in $($targetOu.DistinguishedName)." -ForegroundColor Yellow
     return
 }
-Write-ADAuditRecord -Path $AuditLogPath -Action 'MoveUser' -Target $target -TargetType 'User' -Status 'Started' -Details "Moving user '$($user.SamAccountName)' from current OU to '$($targetOu.DistinguishedName)'."
 if ($PSCmdlet.ShouldProcess($user.SamAccountName,"Move user to $($targetOu.DistinguishedName)")) {
+    $mutationAttempted = $false
     try {
-        Move-ADObject @adContext -Identity $user -TargetPath $targetOu.DistinguishedName -ErrorAction Stop
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'MoveUser' -Target $target -TargetType 'User' -Status 'Started' -Details "Moving user '$($user.SamAccountName)' from current OU to '$($targetOu.DistinguishedName)'."
+        $mutationAttempted = $true
+        Move-ADObject @adContext -Identity $user -TargetPath $targetOu.DistinguishedName -Confirm:$false -ErrorAction Stop
 
         $verifiedUser = Get-ADUser @adContext -Identity $user.SamAccountName -Properties DistinguishedName -ErrorAction Stop
-        $verifiedParentDn = Get-ParentDistinguishedName -DistinguishedName $verifiedUser.DistinguishedName
+        $verifiedParentDn = Get-ADDistinguishedNameParent -DistinguishedName $verifiedUser.DistinguishedName
         if (-not $verifiedParentDn.Equals($targetOu.DistinguishedName, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Move verification failed for '$($user.SamAccountName)': the account is still not located in '$($targetOu.DistinguishedName)'. Current DN: '$($verifiedUser.DistinguishedName)'."
         }
@@ -91,10 +79,19 @@ if ($PSCmdlet.ShouldProcess($user.SamAccountName,"Move user to $($targetOu.Disti
         Write-Host "Moved $($user.SamAccountName) to $($targetOu.DistinguishedName)" -ForegroundColor Green
     }
     catch {
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'MoveUser' -Target $target -TargetType 'User' -Status 'Failed' -Message $_.Exception.Message -Details "Move failed for user '$($user.SamAccountName)'."
+        $failureStatus = if ($mutationAttempted) { 'CompletedWithErrors' } else { 'Failed' }
+        $failureDetails = "Move failed for user '$($user.SamAccountName)'."
+        if ($mutationAttempted) {
+            $failureDetails += ' The move may already have been applied; inspect the account location before retrying.'
+        }
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'MoveUser' -Target $target -TargetType 'User' -Status $failureStatus -Message $_.Exception.Message -Details $failureDetails
         throw
     }
 }
 else {
     Write-ADAuditRecord -Path $AuditLogPath -Action 'MoveUser' -Target $target -TargetType 'User' -Status 'Preview' -Details "Preview only: would move user '$($user.SamAccountName)' to OU '$($targetOu.DistinguishedName)'."
+}
+}
+finally {
+    Clear-ADToolContext
 }

@@ -66,9 +66,9 @@ if ($DeleteEverything) {
     $resetArguments['RemoveOrganizationalUnit'] = $true
 }
 
-# Forward -WhatIf explicitly (it's a real boolean). Do NOT forward -Confirm
-# explicitly: $ConfirmPreference is a ConfirmImpact enum, not a boolean, and
-# passing it as a switch value forces confirmation on almost every run.
-# $ConfirmPreference already flows into the nested script via normal
-# variable scope inheritance, so no extra work is needed for it.
+# Forward the actual common-parameter values instead of relying on preference
+# variable inheritance through the nested script invocation.
+if ($PSBoundParameters.ContainsKey('Confirm')) {
+    $resetArguments['Confirm'] = [bool]$PSBoundParameters['Confirm']
+}
 & $resetScriptPath @resetArguments -WhatIf:$WhatIfPreference

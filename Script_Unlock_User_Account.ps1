@@ -35,6 +35,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 $user=Resolve-ADIdentitySafe $Identity -Server $Server -Credential $Credential
@@ -50,7 +51,7 @@ if (-not $user) {
 Write-ADAuditRecord -Path $AuditLogPath -Action 'UnlockAccount' -Target $user.DistinguishedName -TargetType 'User' -Status 'Started' -Details "Unlock requested for user '$($user.SamAccountName)'."
 if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Unlock account')) {
     try {
-        Unlock-ADAccount @adContext -Identity $user -ErrorAction Stop
+        Unlock-ADAccount @adContext -Identity $user -Confirm:$false -ErrorAction Stop
 
         $verifiedUser = Get-ADUser @adContext -Identity $user.SamAccountName -Properties LockedOut -ErrorAction Stop
         if ($verifiedUser.LockedOut) {
@@ -62,3 +63,7 @@ if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Unlock account')) {
     catch { Write-ADAuditRecord -Path $AuditLogPath -Action 'UnlockAccount' -Target $user.DistinguishedName -TargetType 'User' -Status 'Failed' -Message $_.Exception.Message -Details "Unlock failed for user '$($user.SamAccountName)'."; throw }
 }
 else { Write-ADAuditRecord -Path $AuditLogPath -Action 'UnlockAccount' -Target $user.DistinguishedName -TargetType 'User' -Status 'Preview' -Details "Preview only: would unlock user '$($user.SamAccountName)'." }
+}
+finally {
+    Clear-ADToolContext
+}

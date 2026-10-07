@@ -44,8 +44,14 @@ function Assert-ADOperationsDependencies {
         'Import-ADTools',
         'Set-ADToolContext',
         'Get-ADToolContextParameters',
+        'Move-ADSecuredFileIntoPlace',
+        'Get-ADDistinguishedNameParent',
+        'Test-ADIdentityNotFoundError',
         'ConvertTo-DistinguishedNameValue',
         'ConvertTo-LdapFilterValue',
+        'Get-ADValidatedSecurityGroupSid',
+        'Test-ADUserLifecycleDelegation',
+        'Assert-ADUserLifecycleDelegationSafe',
         'Write-ADAuditRecord'
     )
 
@@ -65,6 +71,11 @@ function Set-ADToolContext {
         [string]$Server,
         [System.Management.Automation.PSCredential]$Credential
     )
+    $existingADDrive = Get-PSDrive -Name AD -ErrorAction SilentlyContinue
+    if ($script:ADToolContextDepth -eq 0 -and $existingADDrive -and -not $script:CreatedADToolDrive) {
+        throw "A pre-existing AD: drive was found. Its target server cannot be verified safely; remove it or use a clean PowerShell session before starting AD automation."
+    }
+
     if ($script:ADToolContextDepth -eq 0) {
         $script:SavedADToolDefaults = @{
             HasServer = $global:PSDefaultParameterValues.ContainsKey('*-AD*:Server')
@@ -124,6 +135,10 @@ function Get-ADToolContextParameters {
 }
 
 function Clear-ADToolContext {
+    if ($script:ADToolContextDepth -le 0 -and $null -eq $script:SavedADToolDefaults -and -not $script:CreatedADToolDrive) {
+        return
+    }
+
     if ($script:ADToolContextDepth -gt 0) {
         $script:ADToolContextDepth--
     }
@@ -154,6 +169,120 @@ function Clear-ADToolContext {
     $script:CreatedADToolDrive = $false
 }
 
+function Move-ADSecuredFileIntoPlace {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$StagingPath,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DestinationPath,
+
+        [switch]$Overwrite
+    )
+
+    $fullStagingPath = [System.IO.Path]::GetFullPath($StagingPath)
+    $fullDestinationPath = [System.IO.Path]::GetFullPath($DestinationPath)
+    if ($fullStagingPath.Equals($fullDestinationPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Staging and destination paths must be different.'
+    }
+    if (-not (Test-Path -LiteralPath $fullStagingPath -PathType Leaf)) {
+        throw "Staging file '$fullStagingPath' does not exist."
+    }
+
+    $stagingDirectory = [System.IO.Path]::GetDirectoryName($fullStagingPath)
+    $destinationDirectory = [System.IO.Path]::GetDirectoryName($fullDestinationPath)
+    if (-not $stagingDirectory.Equals($destinationDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Staging and destination files must be in the same directory for a safe atomic move.'
+    }
+
+    $destinationExists = Test-Path -LiteralPath $fullDestinationPath -PathType Leaf
+    if (-not $destinationExists) {
+        try {
+            [System.IO.File]::Move($fullStagingPath, $fullDestinationPath)
+            return
+        }
+        catch [System.IO.IOException] {
+            if (-not (Test-Path -LiteralPath $fullDestinationPath -PathType Leaf)) {
+                throw
+            }
+            if (-not $Overwrite) {
+                throw "Destination file '$fullDestinationPath' was created concurrently; refusing to overwrite it."
+            }
+        }
+    }
+    elseif (-not $Overwrite) {
+        throw "Destination file '$fullDestinationPath' already exists. Specify -Overwrite to replace it."
+    }
+
+    $stagingAcl = Get-Acl -LiteralPath $fullStagingPath -ErrorAction Stop
+    $destinationAcl = Get-Acl -LiteralPath $fullDestinationPath -ErrorAction Stop
+    $backupPath = "$fullDestinationPath.$([Guid]::NewGuid().ToString('N')).bak"
+    $replacementCompleted = $false
+    try {
+        Set-Acl -LiteralPath $fullDestinationPath -AclObject $stagingAcl -ErrorAction Stop
+        [System.IO.File]::Replace($fullStagingPath, $fullDestinationPath, $backupPath)
+        $replacementCompleted = $true
+    }
+    catch {
+        $replacementError = $_
+        if (-not $replacementCompleted -and (Test-Path -LiteralPath $fullDestinationPath -PathType Leaf)) {
+            try {
+                Set-Acl -LiteralPath $fullDestinationPath -AclObject $destinationAcl -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Failed to restore the original ACL on '$fullDestinationPath' after secure replacement failed: $($_.Exception.Message)"
+            }
+        }
+        throw $replacementError
+    }
+    finally {
+        if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Warning "Failed to remove secured replacement backup '$backupPath': $($_.Exception.Message)"
+            }
+        }
+    }
+}
+
+function New-ADTerminationDescription {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$ExistingDescription,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Reason,
+
+        [datetime]$TerminationDate = [datetime]::Now
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Reason)) {
+        throw 'Termination reason cannot be blank.'
+    }
+
+    $terminationNote = "TERMINATED on $($TerminationDate.ToString('yyyy-MM-dd')) - Reason: $Reason"
+    $existingValue = if ($null -eq $ExistingDescription) { '' } else { $ExistingDescription }
+
+    if ($existingValue.IndexOf($terminationNote, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        return $existingValue
+    }
+
+    $separator = if ([string]::IsNullOrWhiteSpace($existingValue)) { '' } else { ' | ' }
+    $updatedDescription = "$existingValue$separator$terminationNote"
+    if ($updatedDescription.Length -gt 1024) {
+        throw "Termination note would exceed the Active Directory description limit of 1024 characters; no description change was made."
+    }
+
+    return $updatedDescription
+}
+
 function ConvertTo-LdapFilterValue {
     param([Parameter(Mandatory)][string]$Value)
     $builder = [Text.StringBuilder]::new()
@@ -177,6 +306,148 @@ function ConvertTo-DistinguishedNameValue {
     elseif ($escaped.StartsWith('#')) { $escaped = '\23' + $escaped.Substring(1) }
     if ($escaped.EndsWith(' ')) { $escaped = $escaped.Substring(0, $escaped.Length - 1) + '\20' }
     $escaped
+}
+
+function Get-ADDistinguishedNameParent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DistinguishedName
+    )
+
+    $leadingRdn = [regex]::Match($DistinguishedName, '^(?:[^,\\]|\\.)*,')
+    if (-not $leadingRdn.Success -or $leadingRdn.Length -ge $DistinguishedName.Length) {
+        throw "Distinguished name '$DistinguishedName' does not contain a parent component."
+    }
+
+    return $DistinguishedName.Substring($leadingRdn.Length)
+}
+
+function Test-ADIdentityNotFoundError {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        if ($exception.GetType().FullName -eq 'Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException') {
+            return $true
+        }
+        $exception = $exception.InnerException
+    }
+
+    return ([string]$ErrorRecord.FullyQualifiedErrorId -match '(^|,)ADIdentityNotFound(,|$)')
+}
+
+function Get-ADValidatedSecurityGroupSid {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [psobject]$Group,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedName,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedParentDistinguishedName
+    )
+
+    $expectedDistinguishedName = "CN=$(ConvertTo-DistinguishedNameValue -Value $ExpectedName),$ExpectedParentDistinguishedName"
+    if ([string]$Group.Name -ine $ExpectedName -or
+        [string]$Group.DistinguishedName -ine $expectedDistinguishedName) {
+        throw "Administrator group '$ExpectedName' was not resolved at its expected distinguished name '$expectedDistinguishedName'."
+    }
+    if ([string]$Group.GroupCategory -ine 'Security') {
+        throw "Administrator group '$ExpectedName' must be a Security group."
+    }
+    if ([string]$Group.GroupScope -ine 'Global') {
+        throw "Administrator group '$ExpectedName' must have Global scope."
+    }
+
+    $sidValue = $Group.SID
+    if ($sidValue -is [System.Security.Principal.SecurityIdentifier]) {
+        return $sidValue
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$sidValue)) {
+        throw "Administrator group '$ExpectedName' has no SID; refusing delegation."
+    }
+
+    try {
+        return [System.Security.Principal.SecurityIdentifier]::new([string]$sidValue)
+    }
+    catch {
+        throw "Administrator group '$ExpectedName' has an invalid SID; refusing delegation. $($_.Exception.Message)"
+    }
+}
+
+function Test-ADUserLifecycleDelegation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$AccessRules,
+
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$GroupSid
+    )
+
+    $userClassGuid = [Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
+    $requiredRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ListChildren -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
+
+    foreach ($rule in $AccessRules) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            continue
+        }
+        if ($rule.ObjectType -ne $userClassGuid -or
+            $rule.InheritedObjectType -ne $userClassGuid -or
+            $rule.InheritanceType -ne [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -or
+            (($rule.ActiveDirectoryRights -band $requiredRights) -ne $requiredRights)) {
+            continue
+        }
+
+        try {
+            $ruleSid = if ($rule.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+                $rule.IdentityReference
+            }
+            else {
+                $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+            }
+            if ($ruleSid -eq $GroupSid) {
+                return $true
+            }
+        }
+        catch {
+            continue
+        }
+    }
+
+    return $false
+}
+
+function Assert-ADUserLifecycleDelegationSafe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Security.Principal.SecurityIdentifier]$GroupSid,
+
+        [Parameter(Mandatory)]
+        [bool]$CreatedByThisRun,
+
+        [Parameter(Mandatory)]
+        [bool]$ExistingDelegation
+    )
+
+    if (-not $CreatedByThisRun -and -not $ExistingDelegation) {
+        throw "Refusing to grant user-lifecycle delegation to pre-existing group SID '$($GroupSid.Value)'. Review the group and have an authorized administrator approve its delegation separately."
+    }
 }
 function Assert-CsvColumns {
     param(
@@ -214,7 +485,7 @@ function Resolve-ADIdentitySafe {
     try { Get-ADUser @context -Identity $Identity -Properties SamAccountName,UserPrincipalName,Name,DistinguishedName,Enabled -ErrorAction Stop }
     catch {
         $message = $_.Exception.Message
-        if ($message -match 'Cannot find|not found|does not exist') {
+        if (Test-ADIdentityNotFoundError -ErrorRecord $_) {
             throw "User '$Identity' was not found. $message"
         }
         throw "Unable to resolve user '$Identity'. $message"
@@ -235,7 +506,7 @@ function Test-ADUserExists {
         return $true
     }
     catch {
-        if ($_.Exception.Message -match 'Cannot find|not found|does not exist') { return $false }
+        if (Test-ADIdentityNotFoundError -ErrorRecord $_) { return $false }
         throw "Unable to check whether user '$Identity' exists. $($_.Exception.Message)"
     }
 }
@@ -329,4 +600,4 @@ function Export-ADResults {
     $Results | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force
     Write-Host "Results exported to $Path" -ForegroundColor Green
 }
-Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
+Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults

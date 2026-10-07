@@ -38,6 +38,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 
@@ -53,7 +54,7 @@ try {
     }
     else {
         $companyOuFilter = "(ou=$(Escape-LdapFilterValue $OrganizationalUnitName))"
-        $companyOu = @(Get-ADOrganizationalUnit @adContext -LDAPFilter $companyOuFilter -SearchBase $domain.DistinguishedName -SearchScope OneLevel -ErrorAction SilentlyContinue)
+        $companyOu = @(Get-ADOrganizationalUnit @adContext -LDAPFilter $companyOuFilter -SearchBase $domain.DistinguishedName -SearchScope OneLevel -ErrorAction Stop)
         if ($companyOu.Count -gt 0) {
             $companyOu[0].DistinguishedName
         }
@@ -68,6 +69,23 @@ try {
     # created), fetching the same user set from AD repeatedly. Fetch it once here and derive
     # every metric from the single result set.
     $usersInScope = @(Get-ADUser @adContext -SearchBase $effectiveSearchBase -SearchScope Subtree -Filter * -Properties SamAccountName,Department,DistinguishedName,Enabled,LockedOut,PasswordNeverExpires,LastLogonDate,WhenChanged,WhenCreated)
+
+    function Get-ReportGroupMembers {
+        param(
+            [Parameter(Mandatory)]
+            [string]$GroupName
+        )
+
+        try {
+            $group = Get-ADGroup @adContext -Identity $GroupName -ErrorAction Stop
+        }
+        catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+            return @()
+        }
+
+        return @(Get-ADGroupMember @adContext -Identity $group -Recursive -ErrorAction Stop |
+            Where-Object { $_.ObjectClass -eq 'user' })
+    }
 
     function Get-ReportUserSet {
         param(
@@ -86,34 +104,22 @@ try {
         ) + $AdditionalGroupNames
 
         foreach ($groupName in $privilegedGroups) {
-            try {
-                $group = Get-ADGroup @adContext -Identity $groupName -ErrorAction Stop
-                $members = @(Get-ADGroupMember @adContext -Identity $group -Recursive -ErrorAction Stop | Where-Object { $_.ObjectClass -eq 'user' })
-                foreach ($member in $members) {
-                    if ($member.SamAccountName) {
-                        [void]$allUsers.Add($member.SamAccountName)
-                    }
+            $members = @(Get-ReportGroupMembers -GroupName $groupName)
+            foreach ($member in $members) {
+                if ($member.SamAccountName) {
+                    [void]$allUsers.Add($member.SamAccountName)
                 }
-            }
-            catch {
-                # Ignore groups that do not exist in the current domain.
             }
         }
 
         foreach ($user in $UsersInScope) {
             if ($user.Department -and ($user.Department -in $Departments)) {
                 $departmentGroupName = "$($user.Department)-Administrators"
-                try {
-                    $departmentGroup = Get-ADGroup @adContext -Identity $departmentGroupName -ErrorAction Stop
-                    $admins = @(Get-ADGroupMember @adContext -Identity $departmentGroup -Recursive -ErrorAction Stop | Where-Object { $_.ObjectClass -eq 'user' })
-                    foreach ($admin in $admins) {
-                        if ($admin.SamAccountName) {
-                            [void]$allUsers.Add($admin.SamAccountName)
-                        }
+                $admins = @(Get-ReportGroupMembers -GroupName $departmentGroupName)
+                foreach ($admin in $admins) {
+                    if ($admin.SamAccountName) {
+                        [void]$allUsers.Add($admin.SamAccountName)
                     }
-                }
-                catch {
-                    # Ignore missing department admin groups.
                 }
             }
         }
@@ -139,17 +145,8 @@ try {
     $departmentAdminCounts = @{}
     foreach ($department in $Departments) {
         $groupName = "$department-Administrators"
-        try {
-            # BUGFIX: this count used to call Get-ADGroupMember without -Recursive, while every
-            # other place in the script that counts "department administrators" (inside
-            # Get-ReportUserSet) expands membership recursively. A department admin group that
-            # nested another group would be undercounted here but not there.
-            $count = @(Get-ADGroupMember @adContext -Identity $groupName -Recursive -ErrorAction Stop | Where-Object { $_.ObjectClass -eq 'user' }).Count
-            $departmentAdminCounts[$department] = $count
-        }
-        catch {
-            $departmentAdminCounts[$department] = 0
-        }
+        # Expand nested membership consistently with the privileged-user set.
+        $departmentAdminCounts[$department] = @(Get-ReportGroupMembers -GroupName $groupName).Count
     }
 
     $recentWindow = (Get-Date).AddDays(-7)
@@ -214,4 +211,8 @@ try {
 catch {
     Write-ADAuditRecord -Path $AuditLogPath -Action 'SecurityReport' -Target $reportTarget -Status 'Failed' -Message $_.Exception.Message
     throw
+}
+}
+finally {
+    Clear-ADToolContext
 }

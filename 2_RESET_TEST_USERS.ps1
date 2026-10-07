@@ -45,6 +45,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 if ($DeleteEverything) {
@@ -143,3 +144,7 @@ if ($RemoveOrganizationalUnit) {
 Write-Host 'Reset completed.' -ForegroundColor Green
 $resetStatus = if ($WhatIfPreference) { 'Preview' } else { 'Succeeded' }
 Write-ADAuditRecord -Path $AuditLogPath -Action 'ResetTestUsers' -Target $OrganizationalUnitName -Status $resetStatus
+}
+finally {
+    Clear-ADToolContext
+}

@@ -39,6 +39,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 
@@ -71,6 +72,7 @@ if (-not $user) { throw "Unable to resolve user '$Identity'." }
 # operation (Started/Succeeded/Failed/Preview/Skipped) refers to the same
 # value instead of mixing the raw -Identity string with the resolved DN.
 $target = $user.DistinguishedName
+$mutationAttempted = $false
 
 if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Reset password')) {
     # Only record "Started" once we know the change is actually going to be
@@ -80,15 +82,11 @@ if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Reset password')) {
     Write-ADAuditRecord -Path $AuditLogPath -Action 'ResetPassword' -Target $target -TargetType 'User' -Status 'Started' -Details "Resetting password for user '$($user.SamAccountName)'."
 
     try {
-        # Capture the pre-reset state so a plain reset (no -MustChangeAtLogon)
-        # can still be verified — previously only the MustChangeAtLogon case
-        # was checked at all, and an ordinary reset had no verification.
-        $beforePwdLastSet = (Get-ADUser @adContext -Identity $user.SamAccountName -Properties pwdLastSet -ErrorAction Stop).pwdLastSet
-
         # -Confirm:$false on both calls: consent was already obtained via
         # $PSCmdlet.ShouldProcess above; without this, a caller running with
         # -Confirm (or a lowered $ConfirmPreference) would be prompted again
         # for the same logical action.
+        $mutationAttempted = $true
         Set-ADAccountPassword @adContext -Identity $user -Reset -NewPassword $NewPassword -Confirm:$false -ErrorAction Stop
         if ($MustChangeAtLogon) { Set-ADUser @adContext -Identity $user -ChangePasswordAtLogon $true -Confirm:$false -ErrorAction Stop }
 
@@ -99,15 +97,24 @@ if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Reset password')) {
                 throw "Password reset verification failed for '$($user.SamAccountName)': ChangePasswordAtLogon is not enabled."
             }
         }
-        elseif ($verifiedUser.pwdLastSet -eq $beforePwdLastSet) {
-            throw "Password reset verification failed for '$($user.SamAccountName)': pwdLastSet did not change."
+        elseif ($verifiedUser.pwdLastSet -eq 0) {
+            # pwdLastSet has coarse timestamp granularity; comparing it with a
+            # pre-reset read can falsely fail when both operations occur in
+            # the same timestamp interval. For a normal reset, ensure the
+            # account is not left in the must-change-at-logon state instead.
+            throw "Password reset verification failed for '$($user.SamAccountName)': the account is still marked to change its password at next logon."
         }
 
         Write-ADAuditRecord -Path $AuditLogPath -Action 'ResetPassword' -Target $target -TargetType 'User' -Status 'Succeeded' -Details "Password reset completed for user '$($user.SamAccountName)' and verified the requested password-change-at-logon state."
         Write-Host "Password reset for $($user.SamAccountName)" -ForegroundColor Green
     }
     catch {
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'ResetPassword' -Target $target -TargetType 'User' -Status 'Failed' -Message $_.Exception.Message -Details "Password reset failed for user '$($user.SamAccountName)'."
+        $failureStatus = if ($mutationAttempted) { 'CompletedWithErrors' } else { 'Failed' }
+        $failureDetails = "Password reset failed for user '$($user.SamAccountName)'."
+        if ($mutationAttempted) {
+            $failureDetails += ' The password may already have been changed; verify the account state and communicate securely with the user before retrying.'
+        }
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'ResetPassword' -Target $target -TargetType 'User' -Status $failureStatus -Message $_.Exception.Message -Details $failureDetails
         throw
     }
 }
@@ -119,4 +126,8 @@ else {
     $notProceedingStatus = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
     $notProceedingVerb = if ($WhatIfPreference) { 'Preview only: would reset' } else { 'Skipped: declined to reset' }
     Write-ADAuditRecord -Path $AuditLogPath -Action 'ResetPassword' -Target $target -TargetType 'User' -Status $notProceedingStatus -Details "$notProceedingVerb password for user '$($user.SamAccountName)'."
+}
+}
+finally {
+    Clear-ADToolContext
 }

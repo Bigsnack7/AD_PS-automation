@@ -41,6 +41,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 if (-not $Password -and -not $WhatIfPreference) { $Password = Read-Host 'Initial password' -AsSecureString }
@@ -108,3 +109,7 @@ if ($PSCmdlet.ShouldProcess($SamAccountName,'Create Active Directory user')) {
     }
 }
 else { Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Preview' -Details "Preview only: would create user '$SamAccountName' in OU '$Path'." }
+}
+finally {
+    Clear-ADToolContext
+}

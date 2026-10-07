@@ -60,6 +60,7 @@ if (-not $WhatIfPreference -and -not $AllowDestructiveOperation) {
 $target = $Identity
 $user = $null
 $targetOU = $null
+$mutationAttempted = $false
 
 # Everything from here on establishes and relies on process-wide AD context
 # (Set-ADToolContext), so it must always be unwound via Clear-ADToolContext -
@@ -74,15 +75,17 @@ try {
         $targetOU = Get-TargetOU -Path $TerminationOU -Server $Server -Credential $Credential
     }
     $target = if ($targetOU) { "$($user.DistinguishedName) -> $($targetOU.DistinguishedName)" } else { $user.DistinguishedName }
-
-    Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status 'Started' -Details "Terminating user '$($user.SamAccountName)' with reason '$TerminationReason'."
+    $userWithDescription = Get-ADUser @adContext -Identity $user -Properties Description -ErrorAction Stop
+    $terminationDescription = New-ADTerminationDescription -ExistingDescription $userWithDescription.Description -Reason $TerminationReason
 
     if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Terminate Active Directory user')) {
-        Disable-ADAccount @adContext -Identity $user -ErrorAction Stop
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status 'Started' -Details "Terminating user '$($user.SamAccountName)' with reason '$TerminationReason'."
+        $mutationAttempted = $true
+        Disable-ADAccount @adContext -Identity $user -Confirm:$false -ErrorAction Stop
         if ($targetOU) {
-            Move-ADObject @adContext -Identity $user -TargetPath $targetOU.DistinguishedName -ErrorAction Stop
+            Move-ADObject @adContext -Identity $user -TargetPath $targetOU.DistinguishedName -Confirm:$false -ErrorAction Stop
         }
-        Set-ADUser @adContext -Identity $user -Description $TerminationReason -ErrorAction Stop
+        Set-ADUser @adContext -Identity $user -Description $terminationDescription -Confirm:$false -ErrorAction Stop
 
         $verifiedUser = Get-ADUser @adContext -Identity $user.SamAccountName -Properties Enabled, DistinguishedName, Description -ErrorAction Stop
         $verificationIssues = [System.Collections.Generic.List[string]]::new()
@@ -91,30 +94,45 @@ try {
             $verificationIssues.Add("expected the account to be disabled after termination.")
         }
 
-        if ($targetOU -and -not $verifiedUser.DistinguishedName.EndsWith(",$($targetOU.DistinguishedName)", [StringComparison]::OrdinalIgnoreCase)) {
+        if ($targetOU -and
+            -not (Get-ADDistinguishedNameParent -DistinguishedName $verifiedUser.DistinguishedName).Equals(
+                $targetOU.DistinguishedName,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
             $verificationIssues.Add("expected the account to be moved to '$($targetOU.DistinguishedName)' but found '$($verifiedUser.DistinguishedName)'.")
         }
 
-        if ($verifiedUser.Description -ne $TerminationReason) {
-            $verificationIssues.Add("expected the termination reason to be '$TerminationReason' but found '$($verifiedUser.Description)'.")
+        if ($verifiedUser.Description -ne $terminationDescription) {
+            $verificationIssues.Add("expected the termination description to be '$terminationDescription' but found '$($verifiedUser.Description)'.")
         }
 
         if ($verificationIssues.Count -gt 0) {
             throw "Termination verification failed for '$($user.SamAccountName)': $($verificationIssues -join ' ' )"
         }
 
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status 'Succeeded' -Details "Terminated user '$($user.SamAccountName)', verified the disabled state, verified the OU location, and applied reason '$TerminationReason'."
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status 'Succeeded' -Details "Terminated user '$($user.SamAccountName)', verified the disabled state, verified the OU location, and preserved the existing description while recording the termination reason."
         Write-Host "Terminated $($user.SamAccountName)" -ForegroundColor Yellow
     }
     else {
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status 'Preview' -Details "Preview only: would terminate user '$($user.SamAccountName)'."
+        $notProceedingStatus = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
+        $notProceedingDetails = if ($WhatIfPreference) {
+            "Preview only: would terminate user '$($user.SamAccountName)'."
+        }
+        else {
+            "Termination of user '$($user.SamAccountName)' was declined."
+        }
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status $notProceedingStatus -Details $notProceedingDetails
     }
 }
 catch {
     $originalError = $_
     $failureDetails = if ($user) { "Termination failed for user '$($user.SamAccountName)'." } else { "Termination failed while resolving '$Identity'." }
+    $failureStatus = if ($mutationAttempted) { 'CompletedWithErrors' } else { 'Failed' }
+    if ($mutationAttempted) {
+        $failureDetails += ' One or more changes may already have been applied; inspect the account and reconcile its state before retrying.'
+    }
     try {
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status 'Failed' -Message $originalError.Exception.Message -Details $failureDetails
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'TerminateUser' -Target $target -TargetType 'User' -Status $failureStatus -Message $originalError.Exception.Message -Details $failureDetails
     }
     catch {
         Write-Warning "Failed to write audit record: $($_.Exception.Message)"

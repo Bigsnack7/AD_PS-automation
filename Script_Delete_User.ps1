@@ -38,6 +38,7 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+try {
 Set-ADToolContext -Server $Server -Credential $Credential
 $adContext = Get-ADToolContextParameters
 if (-not $WhatIfPreference -and -not $AllowDestructiveOperation) {
@@ -85,4 +86,8 @@ if ($PSCmdlet.ShouldProcess($user.SamAccountName,'Delete Active Directory user')
 }
 else {
     Write-ADAuditRecord -Path $AuditLogPath -Action 'DeleteUser' -Target $user.DistinguishedName -TargetType 'User' -Status 'Preview' -Details "Preview only: would delete user '$($user.SamAccountName)'."
+}
+}
+finally {
+    Clear-ADToolContext
 }
