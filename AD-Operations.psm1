@@ -1,7 +1,9 @@
 Set-StrictMode -Version Latest
 
-$script:SavedADToolDefaults = $null
-$script:ADToolContextDepth = 0
+# Stack of saved PSDefaultParameterValues snapshots, one per successful Set-ADToolContext call.
+# Clear-ADToolContext pops exactly one snapshot, so nested contexts restore the OUTER context
+# (not the operator's original defaults) and an unmatched Clear is a harmless no-op.
+$script:ADToolContextStack = [System.Collections.Generic.Stack[object]]::new()
 $script:CreatedADToolDrive = $false
 
 function Import-ADTools {
@@ -44,15 +46,20 @@ function Assert-ADOperationsDependencies {
         'Import-ADTools',
         'Set-ADToolContext',
         'Get-ADToolContextParameters',
+        'Clear-ADToolContext',
         'Move-ADSecuredFileIntoPlace',
         'Get-ADDistinguishedNameParent',
+        'Split-ADDistinguishedName',
+        'ConvertTo-ADCanonicalDistinguishedName',
         'Test-ADIdentityNotFoundError',
         'Test-ADAccountInactive',
+        'New-ADTerminationDescription',
         'ConvertTo-DistinguishedNameValue',
         'ConvertTo-LdapFilterValue',
         'Get-ADValidatedSecurityGroupSid',
         'Test-ADUserLifecycleDelegation',
         'Assert-ADUserLifecycleDelegationSafe',
+        'Assert-ADTargetWithinRoot',
         'Write-ADAuditRecord'
     )
 
@@ -67,61 +74,90 @@ function Assert-ADOperationsDependencies {
     }
 }
 
+function Get-ADToolDefaultSnapshot {
+    $defaults = $global:PSDefaultParameterValues
+    $hasServer = $defaults.ContainsKey('*-AD*:Server')
+    $hasCredential = $defaults.ContainsKey('*-AD*:Credential')
+    return [pscustomobject]@{
+        HasServer = $hasServer
+        Server = if ($hasServer) { $defaults['*-AD*:Server'] } else { $null }
+        HasCredential = $hasCredential
+        Credential = if ($hasCredential) { $defaults['*-AD*:Credential'] } else { $null }
+    }
+}
+
+function Restore-ADToolDefaultSnapshot {
+    param([Parameter(Mandatory)][psobject]$Snapshot)
+
+    [void]$global:PSDefaultParameterValues.Remove('*-AD*:Server')
+    [void]$global:PSDefaultParameterValues.Remove('*-AD*:Credential')
+    if ($Snapshot.HasServer) { $global:PSDefaultParameterValues['*-AD*:Server'] = $Snapshot.Server }
+    if ($Snapshot.HasCredential) { $global:PSDefaultParameterValues['*-AD*:Credential'] = $Snapshot.Credential }
+}
+
 function Set-ADToolContext {
     param(
         [string]$Server,
         [System.Management.Automation.PSCredential]$Credential
     )
+
+    $isOutermost = ($script:ADToolContextStack.Count -eq 0)
     $existingADDrive = Get-PSDrive -Name AD -ErrorAction SilentlyContinue
-    if ($script:ADToolContextDepth -eq 0 -and $existingADDrive -and -not $script:CreatedADToolDrive) {
+    if ($isOutermost -and $existingADDrive -and -not $script:CreatedADToolDrive) {
         throw "A pre-existing AD: drive was found. Its target server cannot be verified safely; remove it or use a clean PowerShell session before starting AD automation."
     }
 
-    if ($script:ADToolContextDepth -eq 0) {
-        $script:SavedADToolDefaults = @{
-            HasServer = $global:PSDefaultParameterValues.ContainsKey('*-AD*:Server')
-            Server = if ($global:PSDefaultParameterValues.ContainsKey('*-AD*:Server')) { $global:PSDefaultParameterValues['*-AD*:Server'] } else { $null }
-            HasCredential = $global:PSDefaultParameterValues.ContainsKey('*-AD*:Credential')
-            Credential = if ($global:PSDefaultParameterValues.ContainsKey('*-AD*:Credential')) { $global:PSDefaultParameterValues['*-AD*:Credential'] } else { $null }
-        }
-    }
+    $snapshot = Get-ADToolDefaultSnapshot
 
     # Preserve whatever an already-active (outer) context has set unless this call
-    # explicitly overrides it. Without this, a nested Set-ADToolContext call that
-    # omits -Credential/-Server would silently clobber the outer context's values.
-    $existingCredential = if ($global:PSDefaultParameterValues.ContainsKey('*-AD*:Credential')) { $global:PSDefaultParameterValues['*-AD*:Credential'] } else { $null }
-    $existingServer = if ($global:PSDefaultParameterValues.ContainsKey('*-AD*:Server')) { $global:PSDefaultParameterValues['*-AD*:Server'] } else { $null }
-    $effectiveCredential = if ($Credential) { $Credential } else { $existingCredential }
+    # explicitly overrides it.
+    $effectiveCredential = if ($Credential) { $Credential } else { $snapshot.Credential }
+    $createdDriveHere = $false
 
-    [void]$global:PSDefaultParameterValues.Remove('*-AD*:Server')
-    [void]$global:PSDefaultParameterValues.Remove('*-AD*:Credential')
-    $credentialContext = @{}
-    if ($effectiveCredential) {
-        $global:PSDefaultParameterValues['*-AD*:Credential'] = $effectiveCredential
-        $credentialContext.Credential = $effectiveCredential
-    }
-
-    $resolvedServer = if (-not [string]::IsNullOrWhiteSpace($Server)) { $Server } else { $existingServer }
-    if ([string]::IsNullOrWhiteSpace($resolvedServer)) {
-        $resolvedController = Get-ADDomainController @credentialContext -Discover -Writable -ErrorAction Stop
-        $resolvedServer = [string]$resolvedController.HostName
-    }
-
-    $global:PSDefaultParameterValues['*-AD*:Server'] = $resolvedServer
-    if (-not (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
-        $adDriveParameters = @{
-            Name = 'AD'
-            PSProvider = 'ActiveDirectory'
-            Root = '//RootDSE/'
-            Server = $resolvedServer
+    try {
+        [void]$global:PSDefaultParameterValues.Remove('*-AD*:Server')
+        [void]$global:PSDefaultParameterValues.Remove('*-AD*:Credential')
+        $credentialContext = @{}
+        if ($effectiveCredential) {
+            $global:PSDefaultParameterValues['*-AD*:Credential'] = $effectiveCredential
+            $credentialContext.Credential = $effectiveCredential
         }
-        if ($effectiveCredential) { $adDriveParameters.Credential = $effectiveCredential }
-        $null = New-PSDrive @adDriveParameters -ErrorAction Stop
-        $script:CreatedADToolDrive = $true
-    }
 
-    $script:ADToolContextDepth++
-    return $resolvedServer
+        $resolvedServer = if (-not [string]::IsNullOrWhiteSpace($Server)) { $Server } else { [string]$snapshot.Server }
+        if ([string]::IsNullOrWhiteSpace($resolvedServer)) {
+            $resolvedController = Get-ADDomainController @credentialContext -Discover -Writable -ErrorAction Stop
+            $resolvedServer = [string]$resolvedController.HostName
+        }
+
+        $global:PSDefaultParameterValues['*-AD*:Server'] = $resolvedServer
+        if (-not (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
+            $adDriveParameters = @{
+                Name = 'AD'
+                PSProvider = 'ActiveDirectory'
+                Root = '//RootDSE/'
+                Server = $resolvedServer
+                Scope = 'Global'
+            }
+            if ($effectiveCredential) { $adDriveParameters.Credential = $effectiveCredential }
+            $null = New-PSDrive @adDriveParameters -ErrorAction Stop
+            $script:CreatedADToolDrive = $true
+            $createdDriveHere = $true
+        }
+
+        # Only a fully successful call is recorded, so a failed call can never be "cleared".
+        $script:ADToolContextStack.Push($snapshot)
+        return $resolvedServer
+    }
+    catch {
+        $setFailure = $_
+        if ($createdDriveHere) {
+            Remove-PSDrive -Name AD -Scope Global -Force -ErrorAction SilentlyContinue
+            $script:CreatedADToolDrive = $false
+        }
+        # Put the outer context back exactly as it was before this failed call.
+        Restore-ADToolDefaultSnapshot -Snapshot $snapshot
+        throw $setFailure
+    }
 }
 
 function Get-ADToolContextParameters {
@@ -136,38 +172,27 @@ function Get-ADToolContextParameters {
 }
 
 function Clear-ADToolContext {
-    if ($script:ADToolContextDepth -le 0 -and $null -eq $script:SavedADToolDefaults -and -not $script:CreatedADToolDrive) {
+    if ($script:ADToolContextStack.Count -eq 0) {
+        # Nothing active: leave operator-configured defaults alone. Only clean up a drive we created.
+        if ($script:CreatedADToolDrive) {
+            if (Get-PSDrive -Name AD -ErrorAction SilentlyContinue) {
+                Remove-PSDrive -Name AD -Scope Global -Force -ErrorAction SilentlyContinue
+            }
+            $script:CreatedADToolDrive = $false
+        }
         return
     }
 
-    if ($script:ADToolContextDepth -gt 0) {
-        $script:ADToolContextDepth--
-    }
+    $snapshot = $script:ADToolContextStack.Pop()
 
-    if ($script:ADToolContextDepth -gt 0) {
-        # Still inside an outer Set-ADToolContext call - leave the context in place
-        # until the matching outer Clear-ADToolContext call is made.
-        return
-    }
-
-    if ($script:CreatedADToolDrive -and (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
-        Remove-PSDrive -Name AD -Force -ErrorAction SilentlyContinue
-    }
-
-    [void]$global:PSDefaultParameterValues.Remove('*-AD*:Server')
-    [void]$global:PSDefaultParameterValues.Remove('*-AD*:Credential')
-
-    if ($script:SavedADToolDefaults) {
-        if ($script:SavedADToolDefaults.HasServer) {
-            $global:PSDefaultParameterValues['*-AD*:Server'] = $script:SavedADToolDefaults.Server
+    if ($script:ADToolContextStack.Count -eq 0) {
+        if ($script:CreatedADToolDrive -and (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
+            Remove-PSDrive -Name AD -Scope Global -Force -ErrorAction SilentlyContinue
         }
-        if ($script:SavedADToolDefaults.HasCredential) {
-            $global:PSDefaultParameterValues['*-AD*:Credential'] = $script:SavedADToolDefaults.Credential
-        }
+        $script:CreatedADToolDrive = $false
     }
 
-    $script:SavedADToolDefaults = $null
-    $script:CreatedADToolDrive = $false
+    Restore-ADToolDefaultSnapshot -Snapshot $snapshot
 }
 
 function Move-ADSecuredFileIntoPlace {
@@ -264,11 +289,14 @@ function New-ADTerminationDescription {
         [datetime]$TerminationDate = [datetime]::Now
     )
 
-    if ([string]::IsNullOrWhiteSpace($Reason)) {
+    # Control characters (CR/LF/tab...) would break the single-line description and could be used
+    # to forge extra "TERMINATED" entries, so collapse them to a single space.
+    $cleanReason = ($Reason -replace '[\x00-\x1F\x7F]+', ' ').Trim()
+    if ([string]::IsNullOrWhiteSpace($cleanReason)) {
         throw 'Termination reason cannot be blank.'
     }
 
-    $terminationNote = "TERMINATED on $($TerminationDate.ToString('yyyy-MM-dd')) - Reason: $Reason"
+    $terminationNote = "TERMINATED on $($TerminationDate.ToString('yyyy-MM-dd')) - Reason: $cleanReason"
     $existingValue = if ($null -eq $ExistingDescription) { '' } else { $ExistingDescription }
 
     if ($existingValue.IndexOf($terminationNote, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
@@ -285,7 +313,7 @@ function New-ADTerminationDescription {
 }
 
 function ConvertTo-LdapFilterValue {
-    param([Parameter(Mandatory)][string]$Value)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
     $builder = [Text.StringBuilder]::new()
     foreach ($character in $Value.ToCharArray()) {
         switch ([int][char]$character) {
@@ -307,6 +335,73 @@ function ConvertTo-DistinguishedNameValue {
     elseif ($escaped.StartsWith('#')) { $escaped = '\23' + $escaped.Substring(1) }
     if ($escaped.EndsWith(' ')) { $escaped = $escaped.Substring(0, $escaped.Length - 1) + '\20' }
     $escaped
+}
+
+function Split-ADDistinguishedName {
+    # Splits a DN into its RDNs on UNESCAPED commas only.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DistinguishedName)
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $builder = [System.Text.StringBuilder]::new()
+    $escaped = $false
+    foreach ($character in $DistinguishedName.ToCharArray()) {
+        if ($escaped) {
+            [void]$builder.Append($character)
+            $escaped = $false
+            continue
+        }
+        if ($character -eq '\') {
+            [void]$builder.Append($character)
+            $escaped = $true
+            continue
+        }
+        if ($character -eq ',') {
+            $parts.Add($builder.ToString())
+            [void]$builder.Clear()
+            continue
+        }
+        [void]$builder.Append($character)
+    }
+    $parts.Add($builder.ToString())
+    return $parts.ToArray()
+}
+
+function Get-ADDistinguishedNameDepth {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DistinguishedName)
+    return @(Split-ADDistinguishedName -DistinguishedName $DistinguishedName).Count
+}
+
+function ConvertTo-ADCanonicalDistinguishedName {
+    # Normalizes escaping so "\," "\2c" and "\2C" compare equal, and lower-cases the result.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$DistinguishedName)
+
+    $hexDigits = '0123456789abcdefABCDEF'
+    $builder = [System.Text.StringBuilder]::new()
+    $index = 0
+    while ($index -lt $DistinguishedName.Length) {
+        $character = $DistinguishedName[$index]
+        if ($character -eq '\' -and ($index + 1) -lt $DistinguishedName.Length) {
+            $next = $DistinguishedName[$index + 1]
+            if (($index + 2) -lt $DistinguishedName.Length -and
+                $hexDigits.IndexOf($next) -ge 0 -and
+                $hexDigits.IndexOf($DistinguishedName[$index + 2]) -ge 0) {
+                [void]$builder.Append('\').Append($DistinguishedName.Substring($index + 1, 2).ToLowerInvariant())
+                $index += 3
+            }
+            else {
+                [void]$builder.Append('\').Append(([int][char]$next).ToString('x2'))
+                $index += 2
+            }
+        }
+        else {
+            [void]$builder.Append($character)
+            $index++
+        }
+    }
+    return $builder.ToString().ToLowerInvariant()
 }
 
 function Get-ADDistinguishedNameParent {
@@ -340,7 +435,7 @@ function Test-ADIdentityNotFoundError {
         $exception = $exception.InnerException
     }
 
-    return ([string]$ErrorRecord.FullyQualifiedErrorId -match '(^|,)ADIdentityNotFound(,|$)')
+    return ([string]$ErrorRecord.FullyQualifiedErrorId -match '(^|[,:])(ADIdentityNotFound|Microsoft\.ActiveDirectory\.Management\.ADIdentityNotFoundException)(,|$)')
 }
 
 function Test-ADAccountInactive {
@@ -353,15 +448,22 @@ function Test-ADAccountInactive {
         [datetime]$Cutoff
     )
 
-    if ($User.LastLogonDate) {
-        return ([datetime]$User.LastLogonDate -lt $Cutoff)
+    # Property lookups go through PSObject so an ADUser fetched without -Properties LastLogonDate
+    # does not throw under StrictMode. Note LastLogonDate is the replicated lastLogonTimestamp,
+    # which can lag real logons by ~14 days; do not use a cutoff shorter than that.
+    $lastLogonProperty = $User.PSObject.Properties['LastLogonDate']
+    $lastLogon = if ($null -ne $lastLogonProperty) { $lastLogonProperty.Value } else { $null }
+    if ($lastLogon) {
+        return ([datetime]$lastLogon -lt $Cutoff)
     }
 
-    if (-not $User.WhenCreated) {
+    $createdProperty = $User.PSObject.Properties['WhenCreated']
+    $whenCreated = if ($null -ne $createdProperty) { $createdProperty.Value } else { $null }
+    if (-not $whenCreated) {
         return $false
     }
 
-    return ([datetime]$User.WhenCreated -lt $Cutoff)
+    return ([datetime]$whenCreated -lt $Cutoff)
 }
 
 function Get-ADValidatedSecurityGroupSid {
@@ -378,8 +480,10 @@ function Get-ADValidatedSecurityGroupSid {
     )
 
     $expectedDistinguishedName = "CN=$(ConvertTo-DistinguishedNameValue -Value $ExpectedName),$ExpectedParentDistinguishedName"
+    # Compare canonical forms so equivalent escapings ("\," vs "\2c") are not false mismatches.
     if ([string]$Group.Name -ine $ExpectedName -or
-        [string]$Group.DistinguishedName -ine $expectedDistinguishedName) {
+        (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName ([string]$Group.DistinguishedName)) -ne
+        (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName $expectedDistinguishedName)) {
         throw "Administrator group '$ExpectedName' was not resolved at its expected distinguished name '$expectedDistinguishedName'."
     }
     if ([string]$Group.GroupCategory -ine 'Security') {
@@ -471,6 +575,7 @@ function Assert-ADUserLifecycleDelegationSafe {
         throw "Refusing to grant user-lifecycle delegation to pre-existing group SID '$($GroupSid.Value)'. Review the group and have an authorized administrator approve its delegation separately."
     }
 }
+
 function Assert-CsvColumns {
     param(
         [Parameter(Mandatory)][object]$Row,
@@ -482,6 +587,7 @@ function Assert-CsvColumns {
         }
     }
 }
+
 function ConvertTo-CsvBoolean {
     param([AllowNull()][string]$Value, [bool]$Default = $false)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $Default }
@@ -495,6 +601,7 @@ function ConvertTo-CsvBoolean {
         default { throw "Invalid Boolean value '$Value'. Use True, False, Yes, No, 1, or 0." }
     }
 }
+
 function Resolve-ADIdentitySafe {
     param(
         [Parameter(Mandatory)][string]$Identity,
@@ -532,6 +639,7 @@ function Test-ADUserExists {
         throw "Unable to check whether user '$Identity' exists. $($_.Exception.Message)"
     }
 }
+
 function Get-TargetOU {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -568,13 +676,24 @@ function Write-ADAuditRecord {
         [string]$CorrelationId = ''
     )
 
-    $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
+    # Resolve against the PowerShell location (not the process working directory) so the directory
+    # we create is the same one Add-Content writes to.
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $directory = Split-Path -Parent $resolvedPath
     if ($directory -and -not (Test-Path -LiteralPath $directory)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
 
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $resolvedActor = if (-not [string]::IsNullOrWhiteSpace($Actor)) { $Actor } else { $currentIdentity.Name }
+
+    # When -Credential is in use, AD changes are made by that account, not by the logged-on user.
+    $adIdentity = ''
+    if ($global:PSDefaultParameterValues.ContainsKey('*-AD*:Credential')) {
+        $adCredential = $global:PSDefaultParameterValues['*-AD*:Credential']
+        if ($adCredential -is [System.Management.Automation.PSCredential]) { $adIdentity = $adCredential.UserName }
+    }
+    $defaultActor = if ($adIdentity) { $adIdentity } else { $currentIdentity.Name }
+    $resolvedActor = if (-not [string]::IsNullOrWhiteSpace($Actor)) { $Actor } else { $defaultActor }
 
     $record = [ordered]@{
         Timestamp = (Get-Date).ToUniversalTime().ToString('o')
@@ -590,36 +709,62 @@ function Write-ADAuditRecord {
         Source = $Source
         CorrelationId = $CorrelationId
     }
-    ($record | ConvertTo-Json -Compress) | Add-Content -LiteralPath $Path -Encoding UTF8
+    ($record | ConvertTo-Json -Compress) | Add-Content -LiteralPath $resolvedPath -Encoding UTF8
 }
 
 function Assert-ADTargetWithinRoot {
     param(
-        [Parameter(Mandatory)][string]$Target,
-        [Parameter(Mandatory)][string]$AllowedRoot
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Target,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AllowedRoot
     )
-    $targetDn = $Target.Trim()
-    $rootDn = $AllowedRoot.Trim()
-    if (-not $targetDn.Equals($rootDn, [StringComparison]::OrdinalIgnoreCase) -and
-        -not $targetDn.EndsWith(",${rootDn}", [StringComparison]::OrdinalIgnoreCase)) {
+
+    # Compare RDN-by-RDN on UNESCAPED commas. A plain EndsWith(",root") check is bypassable by an
+    # object whose NAME contains the root text (e.g. CN=x\,OU=Company,DC=example,DC=com).
+    $targetParts = @(Split-ADDistinguishedName -DistinguishedName $Target.Trim() |
+        ForEach-Object { (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName $_).Trim() })
+    $rootParts = @(Split-ADDistinguishedName -DistinguishedName $AllowedRoot.Trim() |
+        ForEach-Object { (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName $_).Trim() })
+
+    $isWithinRoot = $rootParts.Count -gt 0 -and $targetParts.Count -ge $rootParts.Count
+    if ($isWithinRoot) {
+        $offset = $targetParts.Count - $rootParts.Count
+        for ($index = 0; $index -lt $rootParts.Count; $index++) {
+            if ($targetParts[$offset + $index] -ne $rootParts[$index]) {
+                $isWithinRoot = $false
+                break
+            }
+        }
+    }
+
+    if (-not $isWithinRoot) {
         throw "Target '$Target' is outside the approved root '$AllowedRoot'."
     }
 }
+
 function Export-ADResults {
-    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Results, [Parameter(Mandatory)][string]$Path)
+    # SupportsShouldProcess so callers can pass -WhatIf. Module functions do not inherit the caller's
+    # $WhatIfPreference, so checking that variable here never worked.
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Results,
+        [Parameter(Mandatory)][string]$Path
+    )
 
-    if ($WhatIfPreference) {
-        Write-Host "WhatIf: would export $($Results.Count) results to '$Path'." -ForegroundColor DarkGray
-        return
-    }
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
 
-    $parent = Split-Path -Parent $Path
-    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     if ($Results.Count -eq 0) {
-        Write-Warning "No results to export to '$Path'."
+        Write-Warning "No results to export to '$resolvedPath'."
         return
     }
-    $Results | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -Force
-    Write-Host "Results exported to $Path" -ForegroundColor Green
+
+    if (-not $PSCmdlet.ShouldProcess($resolvedPath, "Export $($Results.Count) result(s) to CSV")) {
+        return
+    }
+
+    $parent = Split-Path -Parent $resolvedPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $Results | Export-Csv -LiteralPath $resolvedPath -NoTypeInformation -Encoding UTF8 -Force
+    Write-Host "Results exported to $resolvedPath" -ForegroundColor Green
 }
-Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
+
+Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
