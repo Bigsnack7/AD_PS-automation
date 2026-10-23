@@ -88,7 +88,7 @@ $removedOUs = 0
 $removedOtherObjects = 0
 
 try {
-    Set-ADToolContext -Server $Server -Credential $Credential
+    $null = Set-ADToolContext -Server $Server -Credential $Credential
     $adContext = Get-ADToolContextParameters
 
     if ($DeleteEverything) {
