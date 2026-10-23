@@ -3,24 +3,38 @@
 # secrets from a live run against a real domain.
 .env
 .env.*
+!.env.example
 *.secret
 *.secrets
 *.credential
 *.credentials
+*.clixml
 *.pfx
+*.p12
 *.pem
 *.key
-user-passwords.clixml
+*.ppk
+*.kdbx
+id_rsa*
+id_ed25519*
+*.rdp
 *password*.csv
 *password*.txt
 *_results.csv
+
+# ── Real input data ─────────────────────────────────────────────
+# Staff-name lists can be personal data. Commit a *.sample.* file with fake names instead.
+names.txt
+names.csv
+!names.sample.*
 
 # ── Runtime output from these scripts ───────────────────────────
 # Audit logs and provisioning reports are generated locally each
 # run and can contain real usernames/OU paths — don't publish them.
 *.jsonl
-AD-Operations.jsonl
-AD-Provisioning-Report.csv
+*-Report.csv
+output/
+reports/
 *.log
 *.transcript
 PowerShell_transcript.*
