@@ -6,12 +6,17 @@
     Creates one user with the supplied identity and optional department, title, description,
     and password settings. The script validates the module dependency chain, logs operations,
     and verifies the resulting user object before reporting success.
+
+    Pre-flight checks reject a SamAccountName or UPN that already exists. If post-create
+    verification fails, the account HAS been created; the error says so and the account
+    needs manual review (the script never deletes accounts on its own).
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact='Medium')]
 param(
-    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$GivenName,
-    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Surname,
-    [Parameter(Mandatory)][ValidateLength(1,20)][ValidatePattern('^[A-Za-z0-9._$-]+$')][string]$SamAccountName,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][ValidatePattern('\S')][string]$GivenName,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][ValidatePattern('\S')][string]$Surname,
+    # \z (not $) so a trailing newline cannot slip through; AD forbids a trailing period.
+    [Parameter(Mandatory)][ValidateLength(1,20)][ValidatePattern('^(?!.*\.\z)[A-Za-z0-9._$-]+\z')][string]$SamAccountName,
     [string]$UserPrincipalName,
     [Parameter(Mandatory)][string]$Path,
     [SecureString]$Password,
@@ -26,10 +31,22 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-$scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 
+$scriptDirectory = $PSScriptRoot
+if ([string]::IsNullOrEmpty($scriptDirectory) -and $MyInvocation.MyCommand.Path) {
+    $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if ([string]::IsNullOrEmpty($scriptDirectory)) {
+    throw 'Cannot determine the script directory. Run this file from disk, not pasted into a console.'
+}
+
+# Resolve a relative audit path against the caller's location before any AD context
+# (which may mount an AD: drive) is established.
 if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
     $AuditLogPath = Join-Path $scriptDirectory 'AD-Operations.jsonl'
+}
+else {
+    $AuditLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AuditLogPath)
 }
 
 $operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
@@ -38,78 +55,129 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
     throw "Required module not found: $operationsModule"
 }
 
+# Cheap input checks before touching AD.
+$displayName = ("$GivenName $Surname").Trim()
+if ($displayName.Length -gt 64) {
+    throw "The name '$displayName' is $($displayName.Length) characters; Active Directory limits it to 64."
+}
+if ($UserPrincipalName -and $UserPrincipalName -notmatch '^[^@\s]+@[^@\s]+\z') {
+    throw "UserPrincipalName '$UserPrincipalName' is not in the form user@suffix."
+}
+
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 Import-ADTools
+
 try {
-Set-ADToolContext -Server $Server -Credential $Credential
-$adContext = Get-ADToolContextParameters
-if (-not $Password -and -not $WhatIfPreference) { $Password = Read-Host 'Initial password' -AsSecureString }
-if (-not $Password) { $Password = ConvertTo-SecureString 'PreviewOnly-Not-Used-1!' -AsPlainText -Force }
-Get-TargetOU $Path -Server $Server -Credential $Credential | Out-Null
-if (-not $UserPrincipalName) { $UserPrincipalName = "$SamAccountName@$((Get-ADDomain @adContext).DNSRoot)" }
+    Set-ADToolContext -Server $Server -Credential $Credential
+    $adContext = Get-ADToolContextParameters
 
-# BUGFIX: the expected Enabled state depends on -Disabled, so compute it once and verify
-# against it rather than hardcoding "must be enabled" below.
-$expectedEnabled = -not $Disabled.IsPresent
+    # Only a real run prompts. An empty SecureString is a non-null object, so test its
+    # length explicitly. No placeholder password is ever invented for previews.
+    if (-not $Password -and -not $WhatIfPreference) {
+        $Password = Read-Host 'Initial password' -AsSecureString
+    }
+    if (-not $WhatIfPreference -and (-not $Password -or $Password.Length -eq 0)) {
+        throw 'An initial password is required (supply -Password or enter one at the prompt).'
+    }
 
-$params = @{
-    GivenName = $GivenName
-    Surname = $Surname
-    SamAccountName = $SamAccountName
-    UserPrincipalName = $UserPrincipalName
-    Name = "$GivenName $Surname"
-    DisplayName = "$GivenName $Surname"
-    Path = $Path
-    AccountPassword = $Password
-    Enabled = $expectedEnabled
-    ChangePasswordAtLogon = (-not $NoChangePasswordAtLogon.IsPresent)
-    ErrorAction = 'Stop'
-}
-foreach ($name in 'Department','Title','Description') { if ($PSBoundParameters.ContainsKey($name)) { $params[$name]=$PSBoundParameters[$name] } }
-Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Started' -Details "Creating user '$SamAccountName' in OU '$Path'."
-if ($PSCmdlet.ShouldProcess($SamAccountName,'Create Active Directory user')) {
-    try {
-        New-ADUser @adContext @params
+    # Pass -Server/-Credential only when actually supplied, rather than empty/null values.
+    $targetOuArguments = @{}
+    if (-not [string]::IsNullOrWhiteSpace($Server)) { $targetOuArguments['Server'] = $Server }
+    if ($Credential) { $targetOuArguments['Credential'] = $Credential }
+    Get-TargetOU $Path @targetOuArguments | Out-Null
 
-        $verifiedUser = Get-ADUser @adContext -Identity $SamAccountName -Properties Enabled,UserPrincipalName,Department,Title,Description,DistinguishedName -ErrorAction Stop
+    if (-not $UserPrincipalName) {
+        $UserPrincipalName = "$SamAccountName@$((Get-ADDomain @adContext).DNSRoot)"
+    }
+
+    # Fail early with a clear message instead of an obscure AD error mid-create.
+    $safeSam = ConvertTo-LdapFilterValue $SamAccountName
+    $safeUpn = ConvertTo-LdapFilterValue $UserPrincipalName
+    $existing = @(Get-ADUser @adContext -LDAPFilter "(|(sAMAccountName=$safeSam)(userPrincipalName=$safeUpn))" -ErrorAction Stop)
+    if ($existing.Count -gt 0) {
+        throw "A user with SamAccountName '$SamAccountName' or UPN '$UserPrincipalName' already exists ($($existing[0].DistinguishedName))."
+    }
+
+    # The expected Enabled state depends on -Disabled; compute once and verify against it.
+    $expectedEnabled = -not $Disabled.IsPresent
+
+    $params = @{
+        GivenName             = $GivenName
+        Surname               = $Surname
+        SamAccountName        = $SamAccountName
+        UserPrincipalName     = $UserPrincipalName
+        Name                  = $displayName
+        DisplayName           = $displayName
+        Path                  = $Path
+        Enabled               = $expectedEnabled
+        ChangePasswordAtLogon = (-not $NoChangePasswordAtLogon.IsPresent)
+        PassThru              = $true
+        ErrorAction           = 'Stop'
+    }
+    if ($Password) { $params['AccountPassword'] = $Password }
+
+    # Skip empty/whitespace values: AD rejects or ignores them, and verification would
+    # then compare $null against '' and report a false failure.
+    $verifyAttributes = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in 'Department', 'Title', 'Description') {
+        $value = $PSBoundParameters[$name]
+        if ($PSBoundParameters.ContainsKey($name) -and -not [string]::IsNullOrWhiteSpace($value)) {
+            $params[$name] = $value
+            $verifyAttributes.Add($name)
+        }
+    }
+
+    Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Started' -Details "Creating user '$SamAccountName' in OU '$Path'."
+
+    if ($PSCmdlet.ShouldProcess($SamAccountName, 'Create Active Directory user')) {
+        $createdUser = New-ADUser @adContext @params
+
+        # Verify by ObjectGUID: -Identity with a SamAccountName that looks like a SID or
+        # DN could otherwise resolve a different object.
+        $verifiedUser = Get-ADUser @adContext -Identity $createdUser.ObjectGUID -Properties Enabled, UserPrincipalName, Department, Title, Description, DistinguishedName -ErrorAction Stop
         $verificationIssues = [System.Collections.Generic.List[string]]::new()
 
-        # BUGFIX: this used to unconditionally require $verifiedUser.Enabled -eq $true, so
-        # every call made with -Disabled (i.e. every account intentionally created disabled)
-        # failed verification and threw, even though New-ADUser had done exactly what was
-        # asked. Compare against the expected state instead of assuming "enabled" is always
-        # correct.
         if ($verifiedUser.Enabled -ne $expectedEnabled) {
             $verificationIssues.Add("the account Enabled state is '$($verifiedUser.Enabled)' rather than the expected '$expectedEnabled'.")
         }
         if ($verifiedUser.UserPrincipalName -ne $UserPrincipalName) {
             $verificationIssues.Add("the UPN is '$($verifiedUser.UserPrincipalName)' rather than '$UserPrincipalName'.")
         }
-        if ($PSBoundParameters.ContainsKey('Department') -and $verifiedUser.Department -ne $Department) {
-            $verificationIssues.Add("the Department is '$($verifiedUser.Department)' rather than '$Department'.")
-        }
-        if ($PSBoundParameters.ContainsKey('Title') -and $verifiedUser.Title -ne $Title) {
-            $verificationIssues.Add("the Title is '$($verifiedUser.Title)' rather than '$Title'.")
-        }
-        if ($PSBoundParameters.ContainsKey('Description') -and $verifiedUser.Description -ne $Description) {
-            $verificationIssues.Add("the Description is '$($verifiedUser.Description)' rather than '$Description'.")
+        foreach ($name in $verifyAttributes) {
+            if ($verifiedUser.$name -ne $params[$name]) {
+                $verificationIssues.Add("the $name is '$($verifiedUser.$name)' rather than '$($params[$name])'.")
+            }
         }
 
         if ($verificationIssues.Count -gt 0) {
-            throw "Create verification failed for '$SamAccountName': $($verificationIssues -join ' ' )"
+            throw "Create verification failed for '$SamAccountName': $($verificationIssues -join ' ') The account WAS created ($($verifiedUser.DistinguishedName)) and needs manual review."
         }
 
         Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Succeeded' -Details "Created and verified user '$SamAccountName' in OU '$Path'."
         Write-Host "Created $SamAccountName" -ForegroundColor Green
     }
-    catch {
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Failed' -Message $_.Exception.Message -Details "Failed to create user '$SamAccountName' in OU '$Path'."
-        throw
+    else {
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Preview' -Details "Preview only: would create user '$SamAccountName' in OU '$Path'."
     }
 }
-else { Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Preview' -Details "Preview only: would create user '$SamAccountName' in OU '$Path'." }
+catch {
+    $originalError = $_
+    try {
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Failed' -Message $originalError.Exception.Message -Details "Failed to create user '$SamAccountName' in OU '$Path'."
+    }
+    catch {
+        # Never let an audit-write failure mask the real error.
+        Write-Warning "Could not write the failure audit record: $($_.Exception.Message)"
+    }
+    throw $originalError
 }
 finally {
-    Clear-ADToolContext
+    try {
+        Clear-ADToolContext
+    }
+    catch {
+        # A cleanup failure must not replace the original exception.
+        Write-Warning "Clear-ADToolContext failed: $($_.Exception.Message)"
+    }
 }
