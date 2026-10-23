@@ -7,6 +7,10 @@
     It locates the target OU, enumerates the users beneath it, and writes a CSV
     snapshot that can be reviewed, archived, or used as input for later cleanup.
 
+    Text values that begin with a spreadsheet formula character (= + - @ tab CR) are
+    prefixed with a single quote so the CSV cannot execute formulas when opened in Excel.
+    Note that LastLogonDate is derived from lastLogonTimestamp and can lag by up to 14 days.
+
 .EXAMPLE
     .\Export-Test-Users.ps1 -OrganizationalUnitName 'Company'
 
@@ -35,15 +39,49 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptDirectory = $PSScriptRoot
+if ([string]::IsNullOrEmpty($scriptDirectory) -and $MyInvocation.MyCommand.Path) {
+    $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if ([string]::IsNullOrEmpty($scriptDirectory)) {
+    throw 'Cannot determine the script directory. Run this file from disk, not pasted into a console.'
+}
 $operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+
+if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
+    throw "Required module not found: $operationsModule"
+}
+
+# Resolve user-supplied relative paths NOW, against the caller's current location.
+# Set-ADToolContext may mount an AD: PSDrive; resolving later could anchor relative
+# paths to the wrong provider/location.
+function Resolve-FullPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
 
 if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
     $AuditLogPath = Join-Path $scriptDirectory 'AD-Operations.jsonl'
 }
+else {
+    $AuditLogPath = Resolve-FullPath $AuditLogPath
+}
 
-if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
-    throw "Required module not found: $operationsModule"
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = Join-Path $scriptDirectory ("Test-Users-Export-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date))
+}
+else {
+    $OutputPath = Resolve-FullPath $OutputPath
+}
+
+# Neutralise CSV/formula injection (user-controlled attributes such as DisplayName).
+function ConvertTo-SafeCsvValue {
+    param($Value)
+    if ($Value -is [string] -and $Value.Length -gt 0 -and
+        (@('=', '+', '-', '@', "`t", "`r") -contains $Value.Substring(0, 1))) {
+        return "'" + $Value
+    }
+    return $Value
 }
 
 Import-Module ActiveDirectory -ErrorAction Stop
@@ -67,13 +105,13 @@ try {
         throw "More than one OU named '$OrganizationalUnitName' was found below '$domainRoot'. Use a unique OU name."
     }
 
-    if (-not $organizationalUnit) {
+    if ($organizationalUnit.Count -eq 0) {
         Write-Host "OU '$OrganizationalUnitName' was not found. Nothing to export." -ForegroundColor Yellow
         Write-ADAuditRecord -Path $AuditLogPath -Action 'ExportTestUsers' -Target $OrganizationalUnitName -Status 'Skipped' -Message 'Target OU was not found.'
         return
     }
 
-    $ouPath = $organizationalUnit.DistinguishedName
+    $ouPath = $organizationalUnit[0].DistinguishedName
     Write-Verbose "Found OU '$ouPath'. Enumerating descendant users."
 
     $properties = @(
@@ -108,42 +146,57 @@ try {
 
     Write-Verbose "Found $($users.Count) users under '$ouPath'. Building CSV export rows."
 
-    $exportRecords = foreach ($user in $users) {
+    # @() keeps this an array even when exactly one user is found.
+    $exportRecords = @(foreach ($user in $users) {
         [pscustomobject]@{
-            SamAccountName = $user.SamAccountName
-            UserPrincipalName = $user.UserPrincipalName
-            Name = $user.Name
-            DisplayName = $user.DisplayName
-            GivenName = $user.GivenName
-            Surname = $user.Surname
-            Department = $user.Department
-            DistinguishedName = $user.DistinguishedName
-            Enabled = $user.Enabled
-            LockedOut = $user.LockedOut
+            SamAccountName       = ConvertTo-SafeCsvValue $user.SamAccountName
+            UserPrincipalName    = ConvertTo-SafeCsvValue $user.UserPrincipalName
+            Name                 = ConvertTo-SafeCsvValue $user.Name
+            DisplayName          = ConvertTo-SafeCsvValue $user.DisplayName
+            GivenName            = ConvertTo-SafeCsvValue $user.GivenName
+            Surname              = ConvertTo-SafeCsvValue $user.Surname
+            Department           = ConvertTo-SafeCsvValue $user.Department
+            DistinguishedName    = ConvertTo-SafeCsvValue $user.DistinguishedName
+            Enabled              = $user.Enabled
+            LockedOut            = $user.LockedOut
             PasswordNeverExpires = $user.PasswordNeverExpires
-            LastLogonDate = $user.LastLogonDate
-            WhenCreated = $user.WhenCreated
-            WhenChanged = $user.WhenChanged
-            MemberOf = if ($IncludeGroupMembership) {
-                if ($user.MemberOf) { $user.MemberOf -join '; ' } else { '' }
+            LastLogonDate        = $user.LastLogonDate
+            WhenCreated          = $user.WhenCreated
+            WhenChanged          = $user.WhenChanged
+            MemberOf             = if ($IncludeGroupMembership -and $user.MemberOf) {
+                ConvertTo-SafeCsvValue ($user.MemberOf -join '; ')
             }
             else {
                 ''
             }
         }
-    }
+    })
 
-    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-        $OutputPath = Join-Path $scriptDirectory ("Test-Users-Export-{0:yyyyMMdd-HHmmss}.csv" -f (Get-Date))
+    $outputDirectory = Split-Path -Parent $OutputPath
+    if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
     }
 
     Export-ADResults -Results $exportRecords -Path $OutputPath
     Write-ADAuditRecord -Path $AuditLogPath -Action 'ExportTestUsers' -Target $OrganizationalUnitName -Status 'Succeeded' -Message "Exported $($users.Count) users from '$ouPath' to '$OutputPath'."
 }
 catch {
-    Write-ADAuditRecord -Path $AuditLogPath -Action 'ExportTestUsers' -Target $OrganizationalUnitName -Status 'Failed' -Message $_.Exception.Message
-    throw
+    $originalError = $_
+    try {
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'ExportTestUsers' -Target $OrganizationalUnitName -Status 'Failed' -Message $originalError.Exception.Message
+    }
+    catch {
+        # Never let an audit-write failure mask the real error.
+        Write-Warning "Could not write the failure audit record: $($_.Exception.Message)"
+    }
+    throw $originalError
 }
 finally {
-    Clear-ADToolContext
+    try {
+        Clear-ADToolContext
+    }
+    catch {
+        # A cleanup failure must not replace the original exception.
+        Write-Warning "Clear-ADToolContext failed: $($_.Exception.Message)"
+    }
 }
