@@ -1012,6 +1012,49 @@ function Write-ADProvisioningAuditRecord {
     Write-ADAuditRecord -Path $AuditLogPath -Action $Action -Target $Target -TargetType $TargetType -Status $Status -Message $Message -Details $effectiveDetails -Source 'ADAutoX' -CorrelationId $CorrelationId
 }
 
+function Test-ADProvisioningResourceCreatedPreviously {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$TargetType
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    $targetCanonical = ConvertTo-ADCanonicalDistinguishedName -DistinguishedName $Target
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            continue
+        }
+
+        try {
+            $record = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+        }
+        catch {
+            throw "Cannot safely verify prior provisioning of '$Target': audit log '$Path' contains an invalid JSON record. $($_.Exception.Message)"
+        }
+
+        $sourceProperty = $record.PSObject.Properties['Source']
+        $actionProperty = $record.PSObject.Properties['Action']
+        $targetTypeProperty = $record.PSObject.Properties['TargetType']
+        $statusProperty = $record.PSObject.Properties['Status']
+        $targetProperty = $record.PSObject.Properties['Target']
+        if ($sourceProperty -and [string]$sourceProperty.Value -eq 'ADAutoX' -and
+            $actionProperty -and [string]$actionProperty.Value -eq $Action -and
+            $targetTypeProperty -and [string]$targetTypeProperty.Value -eq $TargetType -and
+            $statusProperty -and [string]$statusProperty.Value -eq 'Succeeded' -and
+            $targetProperty -and -not [string]::IsNullOrWhiteSpace([string]$targetProperty.Value) -and
+            (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName ([string]$targetProperty.Value)) -eq $targetCanonical) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 Write-ADProvisioningAuditRecord -Action 'CreateUsers' -Target $OrganizationalUnitName -Status 'Started'
 $auditStarted = $true
 
@@ -1372,10 +1415,11 @@ function Grant-DepartmentUserDelegation {
         [Parameter(Mandatory)][string]$ExpectedGroupParentDistinguishedName,
         [Parameter(Mandatory)][bool]$CreatedByThisRun,
         [Parameter(Mandatory)][string]$TargetOuDistinguishedName,
+        [bool]$PreviouslyCreatedByAutomation = $false,
         [string]$DomainNetBIOSName = ''
     )
 
-    $ouPath = "AD:\$TargetOuDistinguishedName"
+    $ouPath = Get-ADProviderPath -DistinguishedName $TargetOuDistinguishedName -Server $script:adContext.Server
 
     # Scoped OU delegation for the department user-object lifecycle role.
     # This intentionally excludes broad property-write access because attribute updates,
@@ -1407,7 +1451,8 @@ function Grant-DepartmentUserDelegation {
     $groupSid = Get-ADValidatedSecurityGroupSid -Group $Group -ExpectedName $GroupName -ExpectedParentDistinguishedName $ExpectedGroupParentDistinguishedName
     $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
     $alreadyGranted = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
-    Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun -ExistingDelegation $alreadyGranted
+    Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun `
+        -PreviouslyCreatedByAutomation $PreviouslyCreatedByAutomation -ExistingDelegation $alreadyGranted
 
     if ($alreadyGranted) {
         Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `
@@ -1635,6 +1680,7 @@ foreach ($department in $Departments) {
         $departmentAdministratorGroupName = "${department}-Administrators"
         $safeDepartmentAdministratorGroupName = ConvertTo-LdapFilterValue $departmentAdministratorGroupName
         $departmentAdministratorGroupCreatedByThisRun = $false
+        $departmentAdministratorGroupCreatedPreviouslyByAutomation = $false
 
         $departmentAdministratorGroup = @(if (Test-SimulatedResource $departmentAdministratorsOU) {
             @()
@@ -1670,6 +1716,9 @@ foreach ($department in $Departments) {
         }
         else {
             Add-ResourceLedgerEntry -Type 'Group' -DistinguishedName (@($departmentAdministratorGroup)[0].DistinguishedName) -Name $departmentAdministratorGroupName -CreatedByThisRun $false
+            $departmentAdministratorGroupCreatedPreviouslyByAutomation = Test-ADProvisioningResourceCreatedPreviously `
+                -Path $AuditLogPath -Action 'CreateGroup' `
+                -Target (@($departmentAdministratorGroup)[0].DistinguishedName) -TargetType 'Group'
             Write-ADProvisioningAuditRecord -Action 'CreateGroup' -Target (@($departmentAdministratorGroup)[0].DistinguishedName) -TargetType 'Group' -Status 'Skipped' -Details "Department administrator group '$departmentAdministratorGroupName' already existed in '$($departmentAdministratorsOU.DistinguishedName)'; no creation was needed."
         }
 
@@ -1719,7 +1768,9 @@ foreach ($department in $Departments) {
                 -GroupName $departmentAdministratorGroupName `
                 -ExpectedGroupParentDistinguishedName $departmentAdministratorsOU.DistinguishedName `
                 -CreatedByThisRun $departmentAdministratorGroupCreatedByThisRun `
-                -TargetOuDistinguishedName $departmentUserOUs[$department] -DomainNetBIOSName $domainNetBIOSName
+                -TargetOuDistinguishedName $departmentUserOUs[$department] `
+                -PreviouslyCreatedByAutomation $departmentAdministratorGroupCreatedPreviouslyByAutomation `
+                -DomainNetBIOSName $domainNetBIOSName
             Write-DepartmentAttributeDelegationNotice -GroupName $departmentAttributeAdministratorGroupName -TargetOuDistinguishedName $departmentUserOUs[$department]
         }
     }

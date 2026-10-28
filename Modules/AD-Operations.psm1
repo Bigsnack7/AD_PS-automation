@@ -5,6 +5,7 @@ Set-StrictMode -Version Latest
 # (not the operator's original defaults) and an unmatched Clear is a harmless no-op.
 $script:ADToolContextStack = [System.Collections.Generic.Stack[object]]::new()
 $script:CreatedADToolDrive = $false
+$script:ADToolDriveServer = $null
 
 function Import-ADTools {
     Import-Module ActiveDirectory -ErrorAction Stop
@@ -54,6 +55,7 @@ function Assert-ADOperationsDependencies {
         'Set-ADToolContext',
         'Get-ADToolContextParameters',
         'Clear-ADToolContext',
+        'Get-ADProviderPath',
         'Get-ADDistinguishedNameDepth',
         'Add-ADPreflightCheck',
         'Move-ADSecuredFileIntoPlace',
@@ -138,6 +140,20 @@ function Set-ADToolContext {
             $resolvedServer = [string]$resolvedController.HostName
         }
 
+        if ($existingADDrive) {
+            $driveServer = ([string]$script:ADToolDriveServer).Trim().TrimEnd([char]'.')
+            $requestedServer = $resolvedServer.Trim().TrimEnd([char]'.')
+            if (-not $script:CreatedADToolDrive -or
+                $existingADDrive.Provider.Name -ne 'ActiveDirectory' -or
+                [string]::IsNullOrWhiteSpace($driveServer) -or
+                -not [string]::Equals($driveServer, $requestedServer, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "The active AD: drive is not verified for requested server '$resolvedServer'. Clear the current AD context and start a clean session before continuing."
+            }
+        }
+        elseif ($script:ADToolContextStack.Count -gt 0 -and $script:CreatedADToolDrive) {
+            throw 'The AD: drive created by the active AD context was removed before the nested context was established. Clear the current AD context and start it again.'
+        }
+
         $global:PSDefaultParameterValues['*-AD*:Server'] = $resolvedServer
         if (-not (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
             $adDriveParameters = @{
@@ -150,6 +166,7 @@ function Set-ADToolContext {
             if ($effectiveCredential) { $adDriveParameters.Credential = $effectiveCredential }
             $null = New-PSDrive @adDriveParameters -ErrorAction Stop
             $script:CreatedADToolDrive = $true
+            $script:ADToolDriveServer = $resolvedServer
             $createdDriveHere = $true
         }
 
@@ -162,6 +179,7 @@ function Set-ADToolContext {
         if ($createdDriveHere) {
             Remove-PSDrive -Name AD -Scope Global -Force -ErrorAction SilentlyContinue
             $script:CreatedADToolDrive = $false
+            $script:ADToolDriveServer = $null
         }
         # Put the outer context back exactly as it was before this failed call.
         Restore-ADToolDefaultSnapshot -Snapshot $snapshot
@@ -188,6 +206,7 @@ function Clear-ADToolContext {
                 Remove-PSDrive -Name AD -Scope Global -Force -ErrorAction SilentlyContinue
             }
             $script:CreatedADToolDrive = $false
+            $script:ADToolDriveServer = $null
         }
         return
     }
@@ -199,9 +218,39 @@ function Clear-ADToolContext {
             Remove-PSDrive -Name AD -Scope Global -Force -ErrorAction SilentlyContinue
         }
         $script:CreatedADToolDrive = $false
+        $script:ADToolDriveServer = $null
     }
 
     Restore-ADToolDefaultSnapshot -Snapshot $snapshot
+}
+
+function Get-ADProviderPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DistinguishedName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Server
+    )
+
+    $drive = Get-PSDrive -Name AD -ErrorAction SilentlyContinue
+    if (-not $drive -or $drive.Provider.Name -ne 'ActiveDirectory' -or
+        -not $script:CreatedADToolDrive -or [string]::IsNullOrWhiteSpace($script:ADToolDriveServer)) {
+        throw 'The AD: drive is unavailable or is not owned by a verified AD tool context. Establish the AD context before accessing directory ACLs.'
+    }
+
+    $driveServer = $script:ADToolDriveServer.Trim().TrimEnd([char]'.')
+    $requestedServer = $Server.Trim().TrimEnd([char]'.')
+    if (-not [string]::Equals($driveServer, $requestedServer, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "The AD: drive targets '$($script:ADToolDriveServer)', not requested server '$Server'."
+    }
+
+    # AD provider paths use backtick escaping for path separators; preserve DN escaping.
+    $providerSafeDistinguishedName = $DistinguishedName.Replace('`', '``').Replace('/', '`/')
+    return "AD:\$providerSafeDistinguishedName"
 }
 
 function Move-ADSecuredFileIntoPlace {
@@ -602,10 +651,12 @@ function Assert-ADUserLifecycleDelegationSafe {
         [bool]$CreatedByThisRun,
 
         [Parameter(Mandatory)]
-        [bool]$ExistingDelegation
+        [bool]$ExistingDelegation,
+
+        [bool]$PreviouslyCreatedByAutomation = $false
     )
 
-    if (-not $CreatedByThisRun -and -not $ExistingDelegation) {
+    if (-not $CreatedByThisRun -and -not $PreviouslyCreatedByAutomation -and -not $ExistingDelegation) {
         throw "Refusing to grant user-lifecycle delegation to pre-existing group SID '$($GroupSid.Value)'. Review the group and have an authorized administrator approve its delegation separately."
     }
 }
@@ -801,4 +852,4 @@ function Export-ADResults {
     Write-Host "Results exported to $resolvedPath" -ForegroundColor Green
 }
 
-Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,Add-ADPreflightCheck,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
+Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Get-ADProviderPath,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,Add-ADPreflightCheck,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults

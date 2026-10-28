@@ -265,6 +265,7 @@ Get-ADAutoXLedger
 - **Single preflight:** `Invoke-ADAutoXPreflight` contains the provisioning preflight logic. The compatibility function `Test-ADProvisioningPreflight` delegates to it. It performs non-mutating dependency, domain, input, OU, group, and delegation checks applicable to the requested provisioning run. Lifecycle commands resolve and validate their targets, but do not run this provisioning preflight.
 - **Protected-account guard:** applicable lifecycle actions refuse accounts with `AdminCount = 1`, membership in the configured protected groups, `IsCriticalSystemObject = $true`, built-in SAM names (`Administrator`, `Guest`, `krbtgt`), or the account running the script. Accidental-deletion protection is checked for termination and deletion. An explicit `-AllowProtectedAccount` bypass logs a warning and audit entry; use it only with specific approval. The check is not a substitute for reviewing the target and change.
 - **`-WhatIf` / `-Confirm`:** commands that declare `SupportsShouldProcess` can preview or confirm their guarded changes. Read-only AD queries and preflight checks may still run during `-WhatIf`; it is not an offline simulation. Check command help rather than assuming every script supports these common parameters.
+- **Pinned AD provider drive:** the tools create `AD:` for the selected domain controller and refuse an unowned pre-existing `AD:` drive whose server cannot be verified. On systems where the ActiveDirectory module auto-mounts that drive, remove it before starting the automation in a clean session. ACL paths retain the DN and escape Active Directory provider path separators.
 - Cleanup commands refuse protected built-in targets (such as `Domain Controllers`), check the exact target DN before live deletion, and process descendants before parents.
 - Bulk inactivity scans over the whole domain require `-AllowDomainWide`.
 
@@ -290,6 +291,7 @@ Get-ADAutoXLedger
 
 - Audit logs and reports contain operator, machine, account, and OU data. Keep them local, access-controlled, and out of version control.
 - Use a dedicated test OU and confirm the domain, OU path, and naming before any live run.
+- Provisioning reuses matching existing OUs and groups. A retry may grant missing delegation to an existing administrator group only when the JSONL audit log contains a successful `CreateGroup` record for that exact group DN; otherwise the pre-existing-group safety guard still refuses the grant.
 
 ## Audit logging
 

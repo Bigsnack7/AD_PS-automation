@@ -83,6 +83,24 @@ Assert-True ((Get-ADDistinguishedNameParent 'CN=User,OU=Users,DC=example,DC=com'
 Assert-True ((Get-ADDistinguishedNameParent 'CN=O\,Brien,OU=Users,DC=example,DC=com') -ceq 'OU=Users,DC=example,DC=com') `
     'DN parent extraction respects escaped commas'
 Assert-Throws { Get-ADDistinguishedNameParent 'OU=Users' } 'DN parent extraction rejects a DN without a parent'
+Assert-Throws { Get-ADProviderPath -DistinguishedName 'OU=Users,DC=example,DC=com' -Server 'dc.example.com' } `
+    'AD ACL paths require a tool-owned AD drive pinned by an active context'
+$operationsSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\AD-Operations.psm1'))
+$operationsTokens = $null
+$operationsParseErrors = $null
+$operationsAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $operationsSource, [ref]$operationsTokens, [ref]$operationsParseErrors
+)
+$providerPathFunction = $operationsAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Get-ADProviderPath'
+}, $true)
+$providerPathSource = if ($providerPathFunction) { $providerPathFunction.Extent.Text } else { '' }
+Assert-True (@($operationsParseErrors).Count -eq 0 -and
+    $providerPathSource.Contains('Replace(''`'', ''``'').Replace(''/'', ''`/'')') -and
+    $providerPathSource.Contains('return "AD:\$providerSafeDistinguishedName"')) `
+    'AD ACL path builder uses AD:\ DN paths and escapes provider path separators'
 $preflightChecks = [System.Collections.Generic.List[psobject]]::new()
 Add-ADPreflightCheck -Checks $preflightChecks -Name 'Offline check' -Status 'Passed' -Details 'Shared helper'
 Assert-True ($preflightChecks.Count -eq 1 -and $preflightChecks[0].Name -ceq 'Offline check' -and
@@ -147,6 +165,46 @@ Assert-True (@($mark42ParseErrors).Count -eq 0 -and
     -not $mark42PreflightSource.Contains('Get-ADGroup') -and
     -not $mark42PreflightSource.Contains('Get-Acl')) `
     'mark42 preflight forwards to the single shared implementation without duplicate AD checks'
+$priorCreateAuditFunction = $mark42Ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Test-ADProvisioningResourceCreatedPreviously'
+}, $true)
+if ($priorCreateAuditFunction) {
+    Invoke-Expression $priorCreateAuditFunction.Extent.Text
+}
+$priorGroupDn = 'CN=IT-Administrators,OU=Administrators,OU=IT,OU=Staff,OU=Company,DC=hexwatch,DC=lab'
+$priorGroupAuditPath = [System.IO.Path]::GetTempFileName()
+try {
+    [pscustomobject]@{
+        Source = 'ADAutoX'
+        Action = 'CreateGroup'
+        Target = $priorGroupDn
+        TargetType = 'Group'
+        Status = 'Succeeded'
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath $priorGroupAuditPath -Encoding UTF8
+    $auditProvenanceMatches = Test-ADProvisioningResourceCreatedPreviously -Path $priorGroupAuditPath `
+        -Action 'CreateGroup' -Target $priorGroupDn -TargetType 'Group'
+    $auditProvenanceRejectsOtherTarget = -not (Test-ADProvisioningResourceCreatedPreviously `
+        -Path $priorGroupAuditPath -Action 'CreateGroup' `
+        -Target 'CN=Other-Administrators,OU=Administrators,OU=IT,OU=Staff,OU=Company,DC=hexwatch,DC=lab' `
+        -TargetType 'Group')
+    Assert-True ($auditProvenanceMatches -and $auditProvenanceRejectsOtherTarget) `
+        'Retry provenance requires a successful automation audit record for the exact group DN'
+    'not-json' | Set-Content -LiteralPath $priorGroupAuditPath -Encoding UTF8
+    Assert-Throws {
+        Test-ADProvisioningResourceCreatedPreviously -Path $priorGroupAuditPath `
+            -Action 'CreateGroup' -Target $priorGroupDn -TargetType 'Group'
+    } 'Malformed audit data prevents automatic authorization of prior-run delegation'
+}
+finally {
+    Remove-Item -LiteralPath $priorGroupAuditPath -Force -ErrorAction Stop
+}
+$mark42SupportsSafeRetry = $mark42Source.Contains('Test-ADProvisioningResourceCreatedPreviously') -and
+    $mark42Source.Contains('-PreviouslyCreatedByAutomation $departmentAdministratorGroupCreatedPreviouslyByAutomation') -and
+    $mark42Source.Contains('already existed in')
+Assert-True $mark42SupportsSafeRetry `
+    'mark42 reuses existing resources and resumes delegation only for an audit-verified automation-created group'
 Assert-True ((Get-ADDistinguishedNameDepth -DistinguishedName 'CN=O\,Brien,OU=Users,DC=example,DC=com') -eq 4) `
     'Shared DN-depth helper counts escaped commas correctly'
 $notFoundError = [System.Management.Automation.ErrorRecord]::new(
@@ -991,7 +1049,10 @@ foreach ($grantPath in @(
 Assert-True $delegationGrantPathsAddOuScopedChildRights 'Both delegation paths grant Create/Delete Child on the target OU itself'
 
 Assert-Throws { Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $false -ExistingDelegation $false } 'New delegation is refused for an unapproved pre-existing group'
+Assert-Throws { Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $false -PreviouslyCreatedByAutomation $false -ExistingDelegation $false } `
+    'Missing audit provenance does not weaken the existing-group delegation guard'
 Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $true -ExistingDelegation $false
+Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $false -PreviouslyCreatedByAutomation $true -ExistingDelegation $false
 Assert-True $true 'Delegation can be granted to a validated group created in this run'
 
 Write-Host "`nOffline tests: $script:Passed passed, $script:Failed failed." -ForegroundColor Cyan

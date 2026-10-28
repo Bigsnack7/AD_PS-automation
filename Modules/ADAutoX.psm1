@@ -710,7 +710,7 @@ function Invoke-ADAutoXLedgerRollback {
                             [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
                             [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
                             [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
-                        $ouPath = "AD:\$($item.DistinguishedName)"
+                        $ouPath = Get-ADProviderPath -DistinguishedName $item.DistinguishedName -Server $adContext.Server
                         $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
                         $rulesToRemove = @($acl.Access | Where-Object {
                             $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
@@ -1050,7 +1050,8 @@ function Invoke-ADAutoXPreflight {
                 else {
                     $groupSid = Get-ADValidatedSecurityGroupSid -Group $adminGroups[0] `
                         -ExpectedName $adminGroupName -ExpectedParentDistinguishedName $adminOuDn
-                    $acl = Get-Acl -LiteralPath "AD:\$departmentUsersDn" -ErrorAction Stop
+                    $aclPath = Get-ADProviderPath -DistinguishedName $departmentUsersDn -Server $ADContext.Server
+                    $acl = Get-Acl -LiteralPath $aclPath -ErrorAction Stop
                     $delegationPresent = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
                     $delegationStatus = if ($delegationPresent) { 'Passed' } else { 'Failed' }
                     $delegationDetails = if ($delegationPresent) {
