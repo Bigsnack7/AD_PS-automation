@@ -20,13 +20,13 @@
     Phase 4 = Report (CSV, JSONL audit, and console summary output).
 
 .EXAMPLE
-    .\mark42.ps1 -AccountCount 100 -WhatIf
+    .\Cmdlets\mark42.ps1 -AccountCount 100 -WhatIf
 
 .EXAMPLE
-    .\mark42.ps1 -AccountCount 100 -OrganizationalUnitName 'Company'
+    .\Cmdlets\mark42.ps1 -AccountCount 100 -OrganizationalUnitName 'Company'
 
 .EXAMPLE
-    .\mark42.ps1 -AccountCount 100 -EnableAccountsAfterVerification
+    .\Cmdlets\mark42.ps1 -AccountCount 100 -EnableAccountsAfterVerification
 
 .PARAMETER AccountCount
     Number of users to create.
@@ -59,16 +59,22 @@
     not remove OUs, groups, group memberships, or ACL delegation changes. Unexpected run-level failures
     can still abort the run and roll back all remaining accounts created by this invocation.
 
+.PARAMETER RollbackCreatedResourcesOnFailure
+    If enabled, an unexpected run-level failure or credential-export failure removes accounts and groups
+    created by this invocation, removes the exact delegation ACEs it added, and removes only empty OUs
+    carrying this provisioner's generated-object marker. Non-empty or unmarked OUs are reported and
+    left in place; OU removal is never recursive. This is intended for the ADAutoX compatibility API.
+
 .PARAMETER PasswordFile
     Destination path for generated account passwords. This parameter must be used with
     -ExportPasswords; credentials are never persisted by default. If export is explicitly enabled
-    and this parameter is omitted, the script uses 'user-passwords.clixml' in the script directory.
+    and this parameter is omitted, the script uses 'user-passwords.clixml' at the repository root.
     The file is written using Export-Clixml and is protected for the current Windows user context.
     It is not a general-purpose encrypted password vault and must be handled as sensitive material.
 
 .PARAMETER ExportPasswords
     Explicitly enables credential export. Use -PasswordFile to select a destination; otherwise the
-    script uses 'user-passwords.clixml' beside the script. Export is supported on Windows only, uses
+    script uses 'user-passwords.clixml' at the repository root. Export is supported on Windows only, uses
     a secured staging file, and refuses to replace an existing destination unless
     -OverwritePasswordFile is also supplied.
 
@@ -142,6 +148,8 @@ param(
     [Alias('RollbackOnFailure', 'RollbackAccountsOnFailure')]
     [switch]$RollbackCreatedAccountsOnFailure,
 
+    [switch]$RollbackCreatedResourcesOnFailure,
+
     [SecureString]$Password,
 
     [string]$Server,
@@ -151,14 +159,22 @@ param(
 
     [PSCredential]$Credential,
 
-    [string]$AuditLogPath = ''
+    [string]$AuditLogPath = '',
+
+    [string]$CorrelationId = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$CorrelationId = if ([string]::IsNullOrWhiteSpace($CorrelationId)) {
+    [Guid]::NewGuid().ToString()
+}
+else {
+    $CorrelationId
+}
 
-$scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$provisioningModule = Join-Path $scriptDirectory 'AD-Provisioning.psm1'
+$scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
+$provisioningModule = Join-Path $scriptDirectory 'Modules\AD-Provisioning.psm1'
 if (-not (Test-Path -LiteralPath $provisioningModule -PathType Leaf)) {
     throw "Required module not found: $provisioningModule"
 }
@@ -180,7 +196,7 @@ if ([string]::IsNullOrWhiteSpace($PasswordFile)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($NamesPath)) {
-    $NamesPath = Join-Path $scriptDirectory 'nigerian-names.txt'
+    $NamesPath = Join-Path $scriptDirectory 'Data\sample-names.txt'
 }
 if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
     $AuditLogPath = Join-Path $scriptDirectory 'AD-Operations.jsonl'
@@ -204,6 +220,10 @@ if ($Password -and -not [string]::IsNullOrWhiteSpace($PasswordPattern)) {
 
 $requestedAccountCount = if ($AdministratorsOnly) { 0 } else { $AccountCount }
 $resourceLedger = [System.Collections.Generic.List[psobject]]::new()
+$passwordRecords = [System.Collections.Generic.List[psobject]]::new()
+$reportRecords = [System.Collections.Generic.List[psobject]]::new()
+$createdAccounts = [System.Collections.Generic.List[psobject]]::new()
+$script:ProvisioningResourceRollbackTriggered = $false
 
 $Departments = @(Test-DepartmentNames -DepartmentNames $Departments)
 if ($Departments.Count -eq 0) { throw 'At least one department is required.' }
@@ -233,7 +253,7 @@ if (-not (Get-Command Get-ADDomain -ErrorAction SilentlyContinue)) {
     throw 'The Active Directory PowerShell module is not available or did not load correctly.'
 }
 
-$operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+$operationsModule = Join-Path $scriptDirectory 'Modules\AD-Operations.psm1'
 
 if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
     throw "Required module not found: $operationsModule"
@@ -281,20 +301,6 @@ function Invoke-ADPreflight {
 
     $checks = [System.Collections.Generic.List[psobject]]::new()
 
-    function Add-PreflightCheck {
-        param(
-            [Parameter(Mandatory)][string]$Name,
-            [Parameter(Mandatory)][string]$Status,
-            [Parameter()][string]$Details = ''
-        )
-
-        $checks.Add([pscustomobject]@{
-                Name = $Name
-                Status = $Status
-                Details = $Details
-            })
-    }
-
     $safeCompanyOuName = ConvertTo-LdapFilterValue $CompanyOuName
     $companyOu = @(Get-ADOrganizationalUnit @adContext -LDAPFilter "(ou=$safeCompanyOuName)" -SearchBase $DomainRoot -SearchScope OneLevel -ErrorAction Stop)
     if ($companyOu.Count -gt 1) {
@@ -302,7 +308,7 @@ function Invoke-ADPreflight {
     }
 
     $companyOuExists = $companyOu.Count -eq 1
-    Add-PreflightCheck -Name 'Company OU' -Status ($(if ($companyOuExists) { 'Passed' } else { 'NeedsAttention' })) -Details "Company OU '$CompanyOuName' already exists: $companyOuExists."
+    Add-ADPreflightCheck -Checks $checks -Name 'Company OU' -Status ($(if ($companyOuExists) { 'Passed' } else { 'NeedsAttention' })) -Details "Company OU '$CompanyOuName' already exists: $companyOuExists."
     Write-Verbose "[Preflight breadcrumb] Company OU check completed. Exists: $companyOuExists."
 
     $safeStaffNamesOuName = ConvertTo-LdapFilterValue $StaffNamesOuName
@@ -323,7 +329,7 @@ function Invoke-ADPreflight {
     }
 
     $staffNamesOuStatus = if ([string]::IsNullOrWhiteSpace($staffNamesOuDistinguishedName)) { 'NeedsAttention' } else { 'Passed' }
-    Add-PreflightCheck -Name 'Staff Names OU' -Status $staffNamesOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($staffNamesOuDistinguishedName)) { "'$StaffNamesOuName' was not found and will be created during Phase 2." } else { "'$StaffNamesOuName' already exists at '$staffNamesOuDistinguishedName'." })
+    Add-ADPreflightCheck -Checks $checks -Name 'Staff Names OU' -Status $staffNamesOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($staffNamesOuDistinguishedName)) { "'$StaffNamesOuName' was not found and will be created during Phase 2." } else { "'$StaffNamesOuName' already exists at '$staffNamesOuDistinguishedName'." })
     Write-Verbose "[Preflight breadcrumb] Staff Names OU check completed. DN: '$staffNamesOuDistinguishedName'."
 
     $departmentOuChecks = [System.Collections.Generic.List[psobject]]::new()
@@ -347,7 +353,7 @@ function Invoke-ADPreflight {
         }
 
         $departmentOuStatus = if ([string]::IsNullOrWhiteSpace($departmentOuDistinguishedName)) { 'NeedsAttention' } else { 'Passed' }
-        Add-PreflightCheck -Name "Department OU: $department" -Status $departmentOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentOuDistinguishedName)) { "Department OU '$department' is not present yet and will be created during Phase 2." } else { "Department OU '$department' already exists at '$departmentOuDistinguishedName'." })
+        Add-ADPreflightCheck -Checks $checks -Name "Department OU: $department" -Status $departmentOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentOuDistinguishedName)) { "Department OU '$department' is not present yet and will be created during Phase 2." } else { "Department OU '$department' already exists at '$departmentOuDistinguishedName'." })
         Write-Verbose "[Preflight breadcrumb] Department OU check completed for '$department'. DN: '$departmentOuDistinguishedName'."
 
         if ($CreateDepartmentAdministrators) {
@@ -373,7 +379,7 @@ function Invoke-ADPreflight {
             $departmentUserOuDistinguishedName = if ($departmentUserOu.Count -eq 1) { $departmentUserOu[0].DistinguishedName } else { '' }
             if (-not $AdministratorsOnly -and -not ($TreatZeroAccountCountAsNone -and $AccountCount -eq 0)) {
                 $departmentUserOuStatus = if ([string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName)) { 'NeedsAttention' } else { 'Passed' }
-                Add-PreflightCheck -Name "Department Users OU: $department" -Status $departmentUserOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName)) { "Department Users OU for '$department' is not present yet and will be created during Phase 2." } else { "Department Users OU for '$department' already exists at '$departmentUserOuDistinguishedName'." })
+                Add-ADPreflightCheck -Checks $checks -Name "Department Users OU: $department" -Status $departmentUserOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName)) { "Department Users OU for '$department' is not present yet and will be created during Phase 2." } else { "Department Users OU for '$department' already exists at '$departmentUserOuDistinguishedName'." })
             }
             Write-Verbose "[Preflight breadcrumb] Users OU check completed for '$department'. DN: '$departmentUserOuDistinguishedName'."
 
@@ -392,7 +398,7 @@ function Invoke-ADPreflight {
 
             $departmentAdministratorsOuDistinguishedName = if ($departmentAdministratorsOu.Count -eq 1) { $departmentAdministratorsOu[0].DistinguishedName } else { '' }
             $departmentAdministratorsOuStatus = if ([string]::IsNullOrWhiteSpace($departmentAdministratorsOuDistinguishedName)) { 'NeedsAttention' } else { 'Passed' }
-            Add-PreflightCheck -Name "Department Administrators OU: $department" -Status $departmentAdministratorsOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentAdministratorsOuDistinguishedName)) { "Department Administrators OU for '$department' is not present yet and will be created during Phase 2." } else { "Department Administrators OU for '$department' already exists at '$departmentAdministratorsOuDistinguishedName'." })
+            Add-ADPreflightCheck -Checks $checks -Name "Department Administrators OU: $department" -Status $departmentAdministratorsOuStatus -Details $(if ([string]::IsNullOrWhiteSpace($departmentAdministratorsOuDistinguishedName)) { "Department Administrators OU for '$department' is not present yet and will be created during Phase 2." } else { "Department Administrators OU for '$department' already exists at '$departmentAdministratorsOuDistinguishedName'." })
             Write-Verbose "[Preflight breadcrumb] Administrators OU check completed for '$department'. DN: '$departmentAdministratorsOuDistinguishedName'."
 
             $adminUsernameTemplate = if ($AdministratorUsername) {
@@ -403,7 +409,7 @@ function Invoke-ADPreflight {
             }
 
             $resolvedAdminSamAccountName = Get-UniqueSamAccountName -BaseName $adminUsernameTemplate -UsedNames ([System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase))
-            Add-PreflightCheck -Name "Administrator SAM name: $department" -Status 'Passed' -Details "Resolved administrator SAM name '$resolvedAdminSamAccountName' for department '$department'."
+            Add-ADPreflightCheck -Checks $checks -Name "Administrator SAM name: $department" -Status 'Passed' -Details "Resolved administrator SAM name '$resolvedAdminSamAccountName' for department '$department'."
             Write-Verbose "[Preflight breadcrumb] SAM name resolved for '$department': '$resolvedAdminSamAccountName'."
 
             if (-not [string]::IsNullOrWhiteSpace($departmentUserOuDistinguishedName) -and -not [string]::IsNullOrWhiteSpace($departmentAdministratorsOuDistinguishedName)) {
@@ -437,7 +443,7 @@ function Invoke-ADPreflight {
                     }
                 }
 
-                Add-PreflightCheck -Name "Delegation state: $department" -Status $delegationStatus -Details $delegationDetails
+                Add-ADPreflightCheck -Checks $checks -Name "Delegation state: $department" -Status $delegationStatus -Details $delegationDetails
             }
         }
     }
@@ -755,7 +761,7 @@ if (-not $domainReachability.IsReachable) {
         'Active Directory is not reachable from this session.',
         'This usually means the machine is not joined to the domain, DNS cannot resolve the domain controller, or the supplied -Server/-Credential is incorrect.',
         'Checklist: join the workstation to the domain; confirm DNS resolves your DC; use -Server "dc01.domain.local" with a valid -Credential; verify the Active Directory RSAT module is installed.',
-        'Example: .\mark42.ps1 -AccountCount 5 -Server "dc01.domain.local" -Credential (Get-Credential)',
+        'Example: .\Cmdlets\mark42.ps1 -AccountCount 5 -Server "dc01.domain.local" -Credential (Get-Credential)',
         "Original error: $($domainReachability.Error)"
     )
     throw ($message -join ' ')
@@ -768,7 +774,7 @@ catch {
     $message = @(
         'Active Directory is not reachable from this session.',
         'Ensure the machine is joined to the domain or use a reachable domain controller with -Server and a valid -Credential.',
-        'Example: .\mark42.ps1 -AccountCount 5 -Server "dc01.domain.local" -Credential (Get-Credential)',
+        'Example: .\Cmdlets\mark42.ps1 -AccountCount 5 -Server "dc01.domain.local" -Credential (Get-Credential)',
         "Original error: $($_.Exception.Message)"
     )
     throw ($message -join ' ')
@@ -843,7 +849,9 @@ function Add-ResourceLedgerEntry {
         [Parameter(Mandatory)][string]$Type,
         [Parameter(Mandatory)][string]$DistinguishedName,
         [string]$Name = '',
-        [bool]$CreatedByThisRun = $true
+        [bool]$CreatedByThisRun = $true,
+        [string]$SecurityIdentifier = '',
+        [string[]]$DelegationRuleTypes = @()
     )
 
     $entry = [pscustomobject]@{
@@ -851,6 +859,8 @@ function Add-ResourceLedgerEntry {
         DistinguishedName = $DistinguishedName
         Name = $Name
         CreatedByThisRun = $CreatedByThisRun
+        SecurityIdentifier = $SecurityIdentifier
+        DelegationRuleTypes = @($DelegationRuleTypes)
     }
 
     $resourceLedger.Add($entry)
@@ -921,6 +931,178 @@ function Invoke-AccountRollback {
         }
         catch {
             Write-Warning "Failed to roll back account '$($createdAccount.SamAccountName)': $($_.Exception.Message)"
+        }
+    }
+}
+
+function Write-ResourceRollbackAudit {
+    param(
+        [Parameter(Mandatory)][string]$Action,
+        [Parameter(Mandatory)][string]$Target,
+        [Parameter(Mandatory)][string]$TargetType,
+        [Parameter(Mandatory)][string]$Status,
+        [Parameter(Mandatory)][string]$Details
+    )
+
+    try {
+        Write-ADProvisioningAuditRecord -Action $Action -Target $Target -TargetType $TargetType -Status $Status -Details $Details
+    }
+    catch {
+        Write-Warning "Could not write rollback audit record for '$Target': $($_.Exception.Message)"
+    }
+}
+
+function Invoke-ProvisioningResourceRollback {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[psobject]]$CreatedAccounts,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[psobject]]$ReportRecords
+    )
+
+    if ($script:ProvisioningResourceRollbackTriggered) {
+        return
+    }
+    $script:ProvisioningResourceRollbackTriggered = $true
+
+    Invoke-AccountRollback -CreatedAccounts $CreatedAccounts -ReportRecords $ReportRecords
+
+    $createdResources = @($resourceLedger | Where-Object { $_.CreatedByThisRun })
+    $delegationEntries = @($createdResources | Where-Object { $_.Type -eq 'Delegation' })
+    $userClassGuid = [Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
+    $childManagementRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild
+    $managedAccessRights = $childManagementRights -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ListChildren -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
+
+    foreach ($entry in $delegationEntries) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($entry.SecurityIdentifier)) {
+                throw "The rollback ledger has no group SID for delegation '$($entry.Name)'."
+            }
+            if (-not $entry.DelegationRuleTypes -or $entry.DelegationRuleTypes.Count -eq 0) {
+                throw "The rollback ledger has no exact delegation-rule ownership data for '$($entry.Name)'."
+            }
+
+            $groupSid = [System.Security.Principal.SecurityIdentifier]::new($entry.SecurityIdentifier)
+            $ouPath = "AD:\$($entry.DistinguishedName)"
+            $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+            $rulesToRemove = @($acl.Access | Where-Object {
+                $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                $ruleSid -eq $groupSid.Value -and
+                -not $_.IsInherited -and
+                $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                (
+                    (('ChildManagement' -in $entry.DelegationRuleTypes) -and
+                        $_.ActiveDirectoryRights -eq $childManagementRights -and
+                        $_.ObjectType -eq $userClassGuid -and
+                        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None -and
+                        $_.InheritedObjectType -eq [Guid]::Empty) -or
+                    (('DescendantUserAccess' -in $entry.DelegationRuleTypes) -and
+                        $_.ActiveDirectoryRights -eq $managedAccessRights -and
+                        $_.ObjectType -eq $userClassGuid -and
+                        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
+                        $_.InheritedObjectType -eq $userClassGuid)
+                )
+            })
+
+            foreach ($rule in $rulesToRemove) {
+                $acl.RemoveAccessRuleSpecific($rule)
+            }
+
+            if ($rulesToRemove.Count -gt 0) {
+                Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
+                $verifiedAcl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+                $remainingRules = @($verifiedAcl.Access | Where-Object {
+                    $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                    $ruleSid -eq $groupSid.Value -and
+                    -not $_.IsInherited -and
+                    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                    (
+                        (('ChildManagement' -in $entry.DelegationRuleTypes) -and
+                            $_.ActiveDirectoryRights -eq $childManagementRights -and
+                            $_.ObjectType -eq $userClassGuid -and
+                            $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None -and
+                            $_.InheritedObjectType -eq [Guid]::Empty) -or
+                        (('DescendantUserAccess' -in $entry.DelegationRuleTypes) -and
+                            $_.ActiveDirectoryRights -eq $managedAccessRights -and
+                            $_.ObjectType -eq $userClassGuid -and
+                            $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
+                            $_.InheritedObjectType -eq $userClassGuid)
+                    )
+                })
+                if ($remainingRules.Count -gt 0) {
+                    throw "One or more run-created delegation rules remain on '$($entry.DistinguishedName)'."
+                }
+            }
+
+            Write-ResourceRollbackAudit -Action 'RollbackDelegation' -Target $entry.Name -TargetType 'Delegation' -Status 'Succeeded' -Details "Removed run-created delegation rules from '$($entry.DistinguishedName)'."
+        }
+        catch {
+            Write-Warning "Failed to roll back delegation '$($entry.Name)' on '$($entry.DistinguishedName)': $($_.Exception.Message)"
+            Write-ResourceRollbackAudit -Action 'RollbackDelegation' -Target $entry.Name -TargetType 'Delegation' -Status 'Failed' -Details $_.Exception.Message
+        }
+    }
+
+    foreach ($entry in @($createdResources | Where-Object { $_.Type -eq 'Group' })) {
+        try {
+            $remainingMembers = @(Get-ADGroupMember @adContext -Identity $entry.DistinguishedName -ErrorAction Stop)
+            if ($remainingMembers.Count -gt 0) {
+                throw "The group contains members not removed by this rollback; it was left in place."
+            }
+
+            Remove-ADGroup @adContext -Identity $entry.DistinguishedName -Confirm:$false -ErrorAction Stop
+            Write-ResourceRollbackAudit -Action 'RollbackGroup' -Target $entry.DistinguishedName -TargetType 'Group' -Status 'Succeeded' -Details 'Removed the group created during this invocation.'
+        }
+        catch {
+            Write-Warning "Failed to roll back group '$($entry.DistinguishedName)': $($_.Exception.Message)"
+            Write-ResourceRollbackAudit -Action 'RollbackGroup' -Target $entry.DistinguishedName -TargetType 'Group' -Status 'Failed' -Details $_.Exception.Message
+        }
+    }
+
+    $createdOUs = @($createdResources |
+        Where-Object { $_.Type -eq 'OrganizationalUnit' } |
+        Sort-Object { $_.DistinguishedName.Length } -Descending)
+    foreach ($entry in $createdOUs) {
+        try {
+            $organizationalUnit = Get-ADOrganizationalUnit @adContext -Identity $entry.DistinguishedName `
+                -Properties Description, ProtectedFromAccidentalDeletion -ErrorAction Stop
+            if ($organizationalUnit.Description -ne $generatedOUDescription) {
+                throw "The OU is not marked as generated by this provisioner; it was left in place."
+            }
+
+            $remainingObjects = @(Get-ADObject @adContext -Filter * -SearchBase $entry.DistinguishedName `
+                -SearchScope OneLevel -ResultSetSize 1 -ErrorAction Stop)
+            if ($remainingObjects.Count -gt 0) {
+                throw "The OU contains objects not removed by this rollback; it was left in place."
+            }
+
+            if ($organizationalUnit.ProtectedFromAccidentalDeletion) {
+                Set-ADOrganizationalUnit @adContext -Identity $entry.DistinguishedName `
+                    -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
+                try {
+                    Remove-ADOrganizationalUnit @adContext -Identity $entry.DistinguishedName -Confirm:$false -ErrorAction Stop
+                }
+                catch {
+                    Set-ADOrganizationalUnit @adContext -Identity $entry.DistinguishedName `
+                        -ProtectedFromAccidentalDeletion $true -ErrorAction Stop
+                    throw
+                }
+            }
+            else {
+                Remove-ADOrganizationalUnit @adContext -Identity $entry.DistinguishedName -Confirm:$false -ErrorAction Stop
+            }
+            Write-ResourceRollbackAudit -Action 'RollbackOU' -Target $entry.DistinguishedName -TargetType 'OrganizationalUnit' -Status 'Succeeded' -Details 'Removed the empty, marked OU created during this invocation.'
+        }
+        catch {
+            Write-Warning "Skipped or failed to roll back OU '$($entry.DistinguishedName)': $($_.Exception.Message)"
+            Write-ResourceRollbackAudit -Action 'RollbackOU' -Target $entry.DistinguishedName -TargetType 'OrganizationalUnit' -Status 'Skipped' -Details $_.Exception.Message
         }
     }
 }
@@ -1059,7 +1241,7 @@ function Write-ADProvisioningAuditRecord {
     }
 
     $effectiveDetails = if ([string]::IsNullOrWhiteSpace($Details)) { $Message } else { $Details }
-    Write-ADAuditRecord -Path $AuditLogPath -Action $Action -Target $Target -TargetType $TargetType -Status $Status -Message $Message -Details $effectiveDetails
+    Write-ADAuditRecord -Path $AuditLogPath -Action $Action -Target $Target -TargetType $TargetType -Status $Status -Message $Message -Details $effectiveDetails -Source 'ADAutoX' -CorrelationId $CorrelationId
 }
 
 Write-ADProvisioningAuditRecord -Action 'CreateUsers' -Target $OrganizationalUnitName -Status 'Started'
@@ -1460,21 +1642,63 @@ function Grant-DepartmentUserDelegation {
     Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun -ExistingDelegation $alreadyGranted
 
     if ($alreadyGranted) {
-        Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName -CreatedByThisRun $false
+        Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `
+            -CreatedByThisRun $false -SecurityIdentifier $groupSid.Value
         Write-ADProvisioningAuditRecord -Action 'GrantDelegation' -Target $GroupName -TargetType 'Delegation' -Status 'Skipped' -Details "Delegation for '$GroupName' on '$TargetOuDistinguishedName' already existed with the scoped descendant User-class ACE; no changes were required."
         return
     }
 
-    $accessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-        $groupSid,
-        $managedAccessRights,
-        [System.Security.AccessControl.AccessControlType]::Allow,
-        $userClassGuid,
-        [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents,
-        $userClassGuid
-    )
+    $childManagementRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild
+    $delegationRuleTypes = [System.Collections.Generic.List[string]]::new()
+    $hasExactChildRule = @($acl.Access | Where-Object {
+        $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $ruleSid -eq $groupSid.Value -and
+        -not $_.IsInherited -and
+        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $_.ActiveDirectoryRights -eq $childManagementRights -and
+        $_.ObjectType -eq $userClassGuid -and
+        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None -and
+        $_.InheritedObjectType -eq [Guid]::Empty
+    }).Count -gt 0
+    $hasExactDescendantRule = @($acl.Access | Where-Object {
+        $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $ruleSid -eq $groupSid.Value -and
+        -not $_.IsInherited -and
+        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        $_.ActiveDirectoryRights -eq $managedAccessRights -and
+        $_.ObjectType -eq $userClassGuid -and
+        $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
+        $_.InheritedObjectType -eq $userClassGuid
+    }).Count -gt 0
 
-    $acl.AddAccessRule($accessRule)
+    if (-not $hasExactChildRule) {
+        $childManagementRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $groupSid,
+            $childManagementRights,
+            [System.Security.AccessControl.AccessControlType]::Allow,
+            $userClassGuid,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+        )
+        $acl.AddAccessRule($childManagementRule)
+        $delegationRuleTypes.Add('ChildManagement')
+    }
+
+    if (-not $hasExactDescendantRule) {
+        $descendantAccessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+            $groupSid,
+            $managedAccessRights,
+            [System.Security.AccessControl.AccessControlType]::Allow,
+            $userClassGuid,
+            [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents,
+            $userClassGuid
+        )
+        $acl.AddAccessRule($descendantAccessRule)
+        $delegationRuleTypes.Add('DescendantUserAccess')
+    }
+
+    Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `
+        -CreatedByThisRun $true -SecurityIdentifier $groupSid.Value -DelegationRuleTypes $delegationRuleTypes.ToArray()
     Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
 
     # Verify the grant landed instead of trusting that Set-Acl did not throw.
@@ -1483,7 +1707,6 @@ function Grant-DepartmentUserDelegation {
         throw "Delegation for group '$GroupName' on '$TargetOuDistinguishedName' could not be verified after Set-Acl."
     }
 
-    Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName -CreatedByThisRun $true
     Write-ADProvisioningAuditRecord -Action 'GrantDelegation' -Target $GroupName -TargetType 'Delegation' -Status 'Succeeded' -Details "Granted scoped user-object lifecycle delegation to '$GroupName' on '$TargetOuDistinguishedName'."
     Write-Host "Delegated scoped user-object lifecycle rights to '$GroupName' on '$TargetOuDistinguishedName' (create/list/read/delete only; explicit attribute/control rights are intentionally excluded)." -ForegroundColor Yellow
 }
@@ -1670,10 +1893,10 @@ foreach ($department in $Departments) {
             else {
                 $createdAdministratorGroup = New-ADGroup @adContext -Name $departmentAdministratorGroupName `
                     -GroupScope Global -GroupCategory Security -Path $departmentAdministratorsOU.DistinguishedName -PassThru -ErrorAction Stop
+                Add-ResourceLedgerEntry -Type 'Group' -DistinguishedName $createdAdministratorGroup.DistinguishedName -Name $departmentAdministratorGroupName -CreatedByThisRun $true
                 $departmentAdministratorGroup = Get-ADGroup @adContext -Identity $createdAdministratorGroup.DistinguishedName `
                     -Properties SID,GroupScope,GroupCategory -ErrorAction Stop
                 $departmentAdministratorGroupCreatedByThisRun = $true
-                Add-ResourceLedgerEntry -Type 'Group' -DistinguishedName $departmentAdministratorGroup.DistinguishedName -Name $departmentAdministratorGroupName -CreatedByThisRun $true
                 Write-ADProvisioningAuditRecord -Action 'CreateGroup' -Target $departmentAdministratorGroup.DistinguishedName -TargetType 'Group' -Status 'Succeeded' -Details "Created department administrator group '$departmentAdministratorGroupName' in '$($departmentAdministratorsOU.DistinguishedName)'."
             }
         }
@@ -1869,8 +2092,6 @@ if ($createDepartmentAdministrators) {
     Write-Verbose "Preflight department administrator SAM account names: $adminNameSummary"
 }
 
-$passwordRecords = [System.Collections.Generic.List[psobject]]::new()
-$reportRecords = [System.Collections.Generic.List[psobject]]::new()
 $createdCount = 0
 $failedCount = 0
 $partialCount = 0
@@ -1881,7 +2102,6 @@ foreach ($department in $Departments) {
     $departmentTotals[$department] = 0
 }
 $startTime = Get-Date
-$createdAccounts = [System.Collections.Generic.List[psobject]]::new()
 $rollbackTriggered = $false
 
 try {
@@ -2319,7 +2539,11 @@ for ($count = 1; $count -le $usersToCreate; $count++) {
     }
 }
 catch {
-    if ($RollbackCreatedAccountsOnFailure -and -not $rollbackTriggered) {
+    if ($RollbackCreatedResourcesOnFailure) {
+        Write-Host 'Full rollback is enabled. Removing run-created accounts, groups, exact delegation rules, and only empty marked OUs.' -ForegroundColor Yellow
+        Invoke-ProvisioningResourceRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
+    }
+    elseif ($RollbackCreatedAccountsOnFailure -and -not $rollbackTriggered) {
         Write-Host 'Account rollback is enabled. Removing only the user accounts created during this invocation; OUs, groups, and delegation changes are intentionally left in place.' -ForegroundColor Yellow
         Invoke-AccountRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
     }
@@ -2328,6 +2552,25 @@ catch {
     }
     Write-ADProvisioningReport -OutputPath $ReportPath -Records $reportRecords -IncludePasswords:$IncludePasswordInReport
     throw
+}
+
+if ($RollbackCreatedResourcesOnFailure -and
+    -not $script:ProvisioningResourceRollbackTriggered -and
+    ($failedCount -gt 0 -or $partialCount -gt 0)) {
+    Write-Host 'Provisioning reported failed or partial accounts. Full rollback is enabled; removing run-created resources.' -ForegroundColor Yellow
+    Invoke-ProvisioningResourceRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
+    $remainingAccountNames = @($createdAccounts | ForEach-Object { $_.SamAccountName })
+    $createdCount = @($reportRecords | Where-Object {
+        $_.Role -eq 'User' -and $_.Username -in $remainingAccountNames
+    }).Count
+    $createdAdminCount = @($reportRecords | Where-Object {
+        $_.Role -eq 'Administrator' -and $_.Username -in $remainingAccountNames
+    }).Count
+    foreach ($department in $Departments) {
+        $departmentTotals[$department] = @($reportRecords | Where-Object {
+            $_.Role -eq 'User' -and $_.Department -eq $department -and $_.Username -in $remainingAccountNames
+        }).Count
+    }
 }
 
 Write-Progress -Activity 'Creating Active Directory users' -Completed
@@ -2340,7 +2583,11 @@ if (-not $WhatIfPreference -and $ExportPasswords -and $PasswordFile -and $passwo
     catch {
         $exportError = $_
         Write-Warning "Credential export failed: $($exportError.Exception.Message)"
-        if ($RollbackCreatedAccountsOnFailure) {
+        if ($RollbackCreatedResourcesOnFailure) {
+            Write-Host 'Full rollback is enabled. Removing run-created resources after credential export failed.' -ForegroundColor Yellow
+            Invoke-ProvisioningResourceRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
+        }
+        elseif ($RollbackCreatedAccountsOnFailure) {
             Write-Host 'Account rollback is enabled. Removing accounts because credential export did not complete.' -ForegroundColor Yellow
             Invoke-AccountRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
         }
@@ -2411,6 +2658,15 @@ Write-Host "Completed. Created: $createdCount; Failed: $failedCount; Skipped: $s
 catch {
     # Any run-level failure after the 'Started' audit record must leave a terminal record.
     $runFailure = $_
+    if ($RollbackCreatedResourcesOnFailure -and -not $script:ProvisioningResourceRollbackTriggered) {
+        Write-Host 'Full rollback is enabled. Removing run-created accounts, groups, exact delegation rules, and only empty marked OUs.' -ForegroundColor Yellow
+        try {
+            Invoke-ProvisioningResourceRollback -CreatedAccounts $createdAccounts -ReportRecords $reportRecords
+        }
+        catch {
+            Write-Warning "Full provisioning rollback encountered an unexpected error: $($_.Exception.Message)"
+        }
+    }
     if ($auditStarted) {
         try {
             Write-ADProvisioningAuditRecord -Action 'CreateUsers' -Target $OrganizationalUnitName -Status 'Failed' -Message $runFailure.Exception.Message

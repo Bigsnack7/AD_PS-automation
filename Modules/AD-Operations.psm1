@@ -29,12 +29,19 @@ function Test-ADDomainReachability {
             IsReachable = $true
             Domain = $domain.DNSRoot
             Forest = $domain.Forest
+            DomainDN = $domain.DistinguishedName
+            NetBIOSName = $domain.NetBIOSName
             Server = $Server
+            Error = ''
         }
     }
     catch {
         return [pscustomobject]@{
             IsReachable = $false
+            Domain = $null
+            Forest = $null
+            DomainDN = $null
+            NetBIOSName = $null
             Error = $_.Exception.Message
             Server = $Server
         }
@@ -47,6 +54,8 @@ function Assert-ADOperationsDependencies {
         'Set-ADToolContext',
         'Get-ADToolContextParameters',
         'Clear-ADToolContext',
+        'Get-ADDistinguishedNameDepth',
+        'Add-ADPreflightCheck',
         'Move-ADSecuredFileIntoPlace',
         'Get-ADDistinguishedNameParent',
         'Split-ADDistinguishedName',
@@ -373,6 +382,22 @@ function Get-ADDistinguishedNameDepth {
     return @(Split-ADDistinguishedName -DistinguishedName $DistinguishedName).Count
 }
 
+function Add-ADPreflightCheck {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[psobject]]$Checks,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Status,
+        [string]$Details = ''
+    )
+
+    $Checks.Add([pscustomobject]@{
+        Name = $Name
+        Status = $Status
+        Details = $Details
+    })
+}
+
 function ConvertTo-ADCanonicalDistinguishedName {
     # Normalizes escaping so "\," "\2c" and "\2C" compare equal, and lower-cases the result.
     [CmdletBinding()]
@@ -521,24 +546,17 @@ function Test-ADUserLifecycleDelegation {
     )
 
     $userClassGuid = [Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
-    $requiredRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
-        [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild -bor
+    $requiredChildRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild
+    $requiredDescendantRights =
         [System.DirectoryServices.ActiveDirectoryRights]::ListChildren -bor
         [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
         [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
         [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
 
+    $hasChildManagementRights = $false
+    $hasUserDescendantRights = $false
     foreach ($rule in $AccessRules) {
-        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
-            continue
-        }
-        if ($rule.ObjectType -ne $userClassGuid -or
-            $rule.InheritedObjectType -ne $userClassGuid -or
-            $rule.InheritanceType -ne [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -or
-            (($rule.ActiveDirectoryRights -band $requiredRights) -ne $requiredRights)) {
-            continue
-        }
-
         try {
             $ruleSid = if ($rule.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
                 $rule.IdentityReference
@@ -547,7 +565,23 @@ function Test-ADUserLifecycleDelegation {
                 $rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
             }
             if ($ruleSid -eq $GroupSid) {
-                return $true
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+                    continue
+                }
+
+                if ($rule.ObjectType -eq $userClassGuid -and
+                    $rule.InheritedObjectType -eq [Guid]::Empty -and
+                    $rule.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None -and
+                    (($rule.ActiveDirectoryRights -band $requiredChildRights) -eq $requiredChildRights)) {
+                    $hasChildManagementRights = $true
+                }
+
+                if ($rule.ObjectType -eq $userClassGuid -and
+                    $rule.InheritedObjectType -eq $userClassGuid -and
+                    $rule.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
+                    (($rule.ActiveDirectoryRights -band $requiredDescendantRights) -eq $requiredDescendantRights)) {
+                    $hasUserDescendantRights = $true
+                }
             }
         }
         catch {
@@ -555,7 +589,7 @@ function Test-ADUserLifecycleDelegation {
         }
     }
 
-    return $false
+    return ($hasChildManagementRights -and $hasUserDescendantRights)
 }
 
 function Assert-ADUserLifecycleDelegationSafe {
@@ -767,4 +801,4 @@ function Export-ADResults {
     Write-Host "Results exported to $resolvedPath" -ForegroundColor Green
 }
 
-Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
+Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,Add-ADPreflightCheck,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults

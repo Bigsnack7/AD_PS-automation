@@ -1,4 +1,4 @@
-$repoRoot = $PSScriptRoot
+$repoRoot = Split-Path -Parent $PSScriptRoot
 $files = Get-ChildItem -Path $repoRoot -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | Sort-Object FullName
 $parseErrors = @()
 foreach ($file in $files) {
