@@ -133,7 +133,7 @@ $forwardArguments['DisableDepartmentAdministratorsByDefault'] = $true
 
 # Verify mark42.ps1 accepts everything we are about to pass, including the two
 # wrapper-injected switches, so an incompatible canonical script fails before any work.
-$canonicalCommand = Get-Command -LiteralPath $canonicalScriptPath -CommandType ExternalScript
+$canonicalCommand = Get-Command -Name $canonicalScriptPath -CommandType ExternalScript -ErrorAction Stop
 $commonParameters = @([System.Management.Automation.PSCmdlet]::CommonParameters) +
                     @([System.Management.Automation.PSCmdlet]::OptionalCommonParameters)
 foreach ($parameterName in $forwardArguments.Keys) {

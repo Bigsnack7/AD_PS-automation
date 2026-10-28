@@ -23,14 +23,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
 
 if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
     $AuditLogPath = Join-Path $scriptDirectory 'AD-Operations.jsonl'
 }
 
 Import-Module ActiveDirectory -ErrorAction Stop
-$operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+$operationsModule = Join-Path $scriptDirectory 'Modules\AD-Operations.psm1'
 
 if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
     throw "Required module not found: $operationsModule"
@@ -53,8 +53,11 @@ try {
         $SearchBase
     }
     else {
-        $companyOuFilter = "(ou=$(Escape-LdapFilterValue $OrganizationalUnitName))"
+        $companyOuFilter = "(ou=$(ConvertTo-LdapFilterValue $OrganizationalUnitName))"
         $companyOu = @(Get-ADOrganizationalUnit @adContext -LDAPFilter $companyOuFilter -SearchBase $domain.DistinguishedName -SearchScope OneLevel -ErrorAction Stop)
+        if ($companyOu.Count -gt 1) {
+            throw "More than one OU named '$OrganizationalUnitName' was found below '$($domain.DistinguishedName)'. Specify -SearchBase to select the intended scope."
+        }
         if ($companyOu.Count -gt 0) {
             $companyOu[0].DistinguishedName
         }
