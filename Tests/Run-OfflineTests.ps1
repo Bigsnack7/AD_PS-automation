@@ -41,20 +41,19 @@ function Assert-Throws {
     Assert-True -Condition $threw -Name $Name
 }
 
-Write-Host 'Running AD_PS offline regression checks (no AD connection or writes).' -ForegroundColor Cyan
+Write-Host 'Running AD_PS offline regression checks (no AD connection or Active Directory changes).' -ForegroundColor Cyan
 
 $rootPowerShellScripts = @(Get-ChildItem -LiteralPath $repoRoot -Filter '*.ps1' -File | Select-Object -ExpandProperty Name)
 $organizedPathsExist = (Test-Path -LiteralPath (Join-Path $repoRoot 'Modules\ADAutoX.psd1') -PathType Leaf) -and
     (Test-Path -LiteralPath (Join-Path $repoRoot 'Cmdlets\mark42.ps1') -PathType Leaf) -and
     (Test-Path -LiteralPath (Join-Path $repoRoot 'Tests\validate_repo.ps1') -PathType Leaf) -and
-    $rootPowerShellScripts.Count -eq 1 -and
-    $rootPowerShellScripts[0] -ceq 'Script_Find_Locked-Out_Users.ps1'
-Assert-True $organizedPathsExist 'Organized implementations have only the intentional locked-account root launcher'
-$lockedUsersLauncher = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Script_Find_Locked-Out_Users.ps1'))
-Assert-True ($lockedUsersLauncher.Contains("Join-Path `$PSScriptRoot 'Cmdlets\Script_Find_Locked-Out_Users.ps1'") -and
-    $lockedUsersLauncher.Contains('& $targetPath @args') -and
-    -not $lockedUsersLauncher.Contains('Invoke-ADPSCommand')) `
-    'Root locked-account launcher forwards directly without a missing helper dependency'
+    (Test-Path -LiteralPath (Join-Path $repoRoot 'Cmdlets\Script_Find_Locked-Out_Users.ps1') -PathType Leaf) -and
+    $rootPowerShellScripts.Count -eq 0
+Assert-True $organizedPathsExist 'PowerShell implementations are organized under Cmdlets, Modules, and Tests'
+$lockedUsersEntryPoint = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\Script_Find_Locked-Out_Users.ps1'))
+Assert-True ($lockedUsersEntryPoint.Contains("Import-Module (Join-Path (Split-Path -Parent `$PSScriptRoot) 'Modules\ADAutoX.psd1')") -and
+    $lockedUsersEntryPoint.Contains('Get-ADAutoXLockedOutUsers @arguments')) `
+    'Locked-account entry point calls the exported module implementation'
 
 $serverDefaultKey = '*-AD*:Server'
 $credentialDefaultKey = '*-AD*:Credential'
@@ -89,6 +88,65 @@ Add-ADPreflightCheck -Checks $preflightChecks -Name 'Offline check' -Status 'Pas
 Assert-True ($preflightChecks.Count -eq 1 -and $preflightChecks[0].Name -ceq 'Offline check' -and
     $preflightChecks[0].Status -ceq 'Passed' -and $preflightChecks[0].Details -ceq 'Shared helper') `
     'Shared preflight helper creates the expected check record'
+
+$preflightProvisioningSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\AD-Provisioning.psm1'))
+$preflightTokens = $null
+$preflightParseErrors = $null
+$preflightProvisioningAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $preflightProvisioningSource, [ref]$preflightTokens, [ref]$preflightParseErrors
+)
+$preflightShimAst = $preflightProvisioningAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Test-ADProvisioningPreflight'
+}, $true)
+$preflightShimCommands = if ($preflightShimAst) {
+    @($preflightShimAst.Body.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst]
+    }, $true) | ForEach-Object { $_.GetCommandName() })
+}
+else { @() }
+Assert-True (@($preflightParseErrors).Count -eq 0 -and @($preflightShimCommands).Count -eq 1 -and
+    [string]$preflightShimCommands -ceq 'Invoke-ADAutoXPreflight') `
+    'Test-ADProvisioningPreflight contains only the compatibility call, not a second preflight implementation'
+
+$preflightModuleSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\ADAutoX.psm1'))
+$preflightModuleTokens = $null
+$preflightModuleParseErrors = $null
+$preflightModuleAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    $preflightModuleSource, [ref]$preflightModuleTokens, [ref]$preflightModuleParseErrors
+)
+$preflightFunctionAst = $preflightModuleAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-ADAutoXPreflight'
+}, $true)
+$preflightFunctionSource = if ($preflightFunctionAst) { $preflightFunctionAst.Extent.Text } else { '' }
+$preflightHasLiveChecks = @('Get-ADDomain', 'Get-ADOrganizationalUnit', 'Get-ADGroup', 'Get-Acl') |
+    Where-Object { $preflightFunctionSource.Contains($_) }
+Assert-True (@($preflightModuleParseErrors).Count -eq 0 -and @($preflightHasLiveChecks).Count -eq 4) `
+    'Unified preflight contains the real AD domain, OU, group, and ACL checks'
+
+$mark42Source = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\mark42.ps1'))
+$mark42Tokens = $null
+$mark42ParseErrors = $null
+$mark42Ast = [System.Management.Automation.Language.Parser]::ParseInput(
+    $mark42Source, [ref]$mark42Tokens, [ref]$mark42ParseErrors
+)
+$mark42PreflightAst = $mark42Ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-ADPreflight'
+}, $true)
+$mark42PreflightSource = if ($mark42PreflightAst) { $mark42PreflightAst.Extent.Text } else { '' }
+Assert-True (@($mark42ParseErrors).Count -eq 0 -and
+    $mark42PreflightSource.Contains('CanonicalProvisioning = $true') -and
+    $mark42PreflightSource.Contains('Invoke-ADAutoXPreflight') -and
+    -not $mark42PreflightSource.Contains('Get-ADOrganizationalUnit') -and
+    -not $mark42PreflightSource.Contains('Get-ADGroup') -and
+    -not $mark42PreflightSource.Contains('Get-Acl')) `
+    'mark42 preflight forwards to the single shared implementation without duplicate AD checks'
 Assert-True ((Get-ADDistinguishedNameDepth -DistinguishedName 'CN=O\,Brien,OU=Users,DC=example,DC=com') -eq 4) `
     'Shared DN-depth helper counts escaped commas correctly'
 $notFoundError = [System.Management.Automation.ErrorRecord]::new(
@@ -281,9 +339,10 @@ $resetRestoresAccidentalDeletionProtection = $resetCleanupSource.Contains('clear
 Assert-True $resetRestoresAccidentalDeletionProtection 'Cleanup restores accidental-deletion protection when a protected OU remains'
 
 $securityReportSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\Script_AD_Security_Report.ps1'))
-$securityReportUsesSharedLdapEscaper = $securityReportSource.Contains('ConvertTo-LdapFilterValue') -and
-    -not $securityReportSource.Contains('Escape-LdapFilterValue')
-Assert-True $securityReportUsesSharedLdapEscaper 'Security report uses the exported LDAP filter escaping helper'
+$securityReportModuleSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\ADAutoX.psm1'))
+$securityReportUsesModuleScan = $securityReportSource.Contains('Get-ADAutoXSecurityScan @scanParameters') -and
+    $securityReportModuleSource.Contains('ConvertTo-LdapFilterValue')
+Assert-True $securityReportUsesModuleScan 'Security report wrapper delegates to the module scan with shared LDAP escaping'
 
 $auditReportRoot = Join-Path ([System.IO.Path]::GetTempPath()) "AD-PS-AuditReportTest-$([Guid]::NewGuid().ToString('N'))"
 $null = New-Item -ItemType Directory -Path $auditReportRoot -ErrorAction Stop
@@ -331,6 +390,73 @@ Assert-True ($lifecycleLedgerEntries.Count -eq 2 -and $lifecycleLedgerEntries[0]
     $lifecycleLedgerEntries[1].Sequence -gt $lifecycleLedgerEntries[0].Sequence) `
     'Lifecycle changes can be stored in the shared rollback ledger as reversible undo entries'
 Initialize-ADAutoXLedger
+
+$contractRunId = [Guid]::NewGuid().ToString()
+$contractEntries = @(
+    Add-ADAutoXLedgerEntry -ObjectType OU -DistinguishedName 'OU=Offline,DC=example,DC=com' `
+        -Name 'Offline' -UndoData @{ GeneratedDescription = 'Generated by test' } -RunId $contractRunId
+    Add-ADAutoXLedgerEntry -ObjectType Group -DistinguishedName 'CN=Offline,OU=Offline,DC=example,DC=com' `
+        -Name 'Offline' -RunId $contractRunId
+    Add-ADAutoXLedgerEntry -ObjectType User -DistinguishedName 'CN=offline,OU=Offline,DC=example,DC=com' `
+        -SamAccountName 'offline' -Name 'offline' -RunId $contractRunId
+    Add-ADAutoXLedgerEntry -ObjectType Delegation -DistinguishedName 'OU=Offline,DC=example,DC=com' `
+        -Name 'Offline' -SecurityIdentifier 'S-1-5-21-111-222-333-444' `
+        -DelegationRuleTypes @('ChildManagement') -RunId $contractRunId
+)
+$expectedLedgerProperties = @(
+    'ObjectType', 'DistinguishedName', 'SamAccountName', 'Name', 'CreatedByThisRun',
+    'Action', 'UndoData', 'SecurityIdentifier', 'DelegationRuleTypes', 'RunId',
+    'Sequence', 'Timestamp'
+)
+$ledgerSchemaConsistent = $contractEntries.Count -eq 4 -and @($contractEntries | Where-Object {
+    $entry = $_
+    @($expectedLedgerProperties | Where-Object { $_ -notin $entry.PSObject.Properties.Name }).Count -gt 0
+}).Count -eq 0 -and
+    @($contractEntries | Select-Object -ExpandProperty ObjectType -Unique).Count -eq 4
+Assert-True $ledgerSchemaConsistent `
+    'Shared ledger writer emits one consistent, run-scoped schema for OU, group, user, and delegation entries'
+Initialize-ADAutoXLedger
+
+$shouldProcessFunctionContracts = @(
+    @{ Path = (Join-Path $repoRoot 'Modules\AD-Provisioning.psm1'); Name = 'Set-DepartmentDelegation' }
+    @{ Path = (Join-Path $repoRoot 'Modules\AD-Provisioning.psm1'); Name = 'Invoke-ProvisioningRollback' }
+    @{ Path = (Join-Path $repoRoot 'Modules\ADAutoX.psm1'); Name = 'Invoke-ADAutoXLifecycleUndo' }
+    @{ Path = (Join-Path $repoRoot 'Modules\ADAutoX.psm1'); Name = 'Invoke-ADAutoXLedgerRollback' }
+)
+$shouldProcessContractsValid = $true
+foreach ($contract in $shouldProcessFunctionContracts) {
+    $tokens = $null
+    $parseErrors = $null
+    $moduleAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $contract.Path,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    $functionAst = $moduleAst.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $contract.Name
+    }, $true)
+    if ($parseErrors.Count -gt 0 -or -not $functionAst -or
+        -not $functionAst.Extent.Text.Contains('[CmdletBinding(SupportsShouldProcess') -or
+        -not $functionAst.Extent.Text.Contains('$PSCmdlet.ShouldProcess')) {
+        $shouldProcessContractsValid = $false
+        break
+    }
+}
+$mark42SourceForShouldProcess = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\mark42.ps1'))
+$resetSourceForShouldProcess = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\Reset-ADAutoXEnvironment.ps1'))
+$unifiedRollbackSourceForShouldProcess = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\ADAutoX.psm1'))
+$shouldProcessContractsValid = $shouldProcessContractsValid -and
+    $mark42SourceForShouldProcess.Contains('$WhatIfPreference') -and
+    $mark42SourceForShouldProcess.Contains('$PSBoundParameters[''Confirm'']') -and
+    $resetSourceForShouldProcess.Contains('$WhatIfPreference') -and
+    $resetSourceForShouldProcess.Contains('$PSBoundParameters[''Confirm'']') -and
+    $unifiedRollbackSourceForShouldProcess.Contains('WhatIf = [bool]$WhatIfPreference') -and
+    $unifiedRollbackSourceForShouldProcess.Contains('$undoParameters.Confirm = $PSBoundParameters[''Confirm'']')
+Assert-True $shouldProcessContractsValid `
+    'Rollback and delegation expose ShouldProcess and preserve WhatIf/Confirm through callers'
+
 $resetEnvironmentPath = Join-Path $repoRoot 'Cmdlets\Reset-ADAutoXEnvironment.ps1'
 $resetEnvironmentSource = [System.IO.File]::ReadAllText($resetEnvironmentPath)
 $resetCleanupTarget = Join-Path (Split-Path -Parent $resetEnvironmentPath) 'Remove-Test-Users.ps1'
@@ -385,18 +511,21 @@ Assert-True $provisionEntrypointUsesCanonicalEngine `
     'ADAutoX provisioning delegates to the canonical engine with sample data, rollback, and correlation wiring'
 $resourceRollback = $provisioningScriptAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-ProvisioningResourceRollback' }, $true)
 $resourceRollbackSource = if ($resourceRollback) { $resourceRollback.Extent.Text } else { '' }
-$resourceRollbackIsSafeguarded = $resourceRollbackSource.Contains("Where-Object { `$_.CreatedByThisRun }") -and
-    $resourceRollbackSource.Contains("'ChildManagement' -in `$entry.DelegationRuleTypes") -and
-    $resourceRollbackSource.Contains("'DescendantUserAccess' -in `$entry.DelegationRuleTypes") -and
-    $resourceRollbackSource.Contains('Get-ADGroupMember @adContext -Identity $entry.DistinguishedName') -and
-    $resourceRollbackSource.Contains('$generatedOUDescription') -and
-    $resourceRollbackSource.Contains('-SearchScope OneLevel') -and
-    $resourceRollbackSource.Contains('-ResultSetSize 1') -and
-    $resourceRollbackSource.Contains('ProtectedFromAccidentalDeletion $true') -and
-    $resourceRollbackSource.Contains('-Confirm:$false -ErrorAction Stop') -and
-    -not $resourceRollbackSource.Contains('-Recursive')
-Assert-True $resourceRollbackIsSafeguarded `
-    'Full provisioning rollback preserves group members and removes only empty marked OUs non-recursively'
+$resourceRollbackModuleSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\ADAutoX.psm1'))
+$resourceRollbackIsCentralized = $resourceRollbackSource.Contains('Invoke-ADAutoXLedgerRollback') -and
+    $resourceRollbackSource.Contains('RunId = $CorrelationId') -and
+    $resourceRollbackModuleSource.Contains("'ChildManagement'") -and
+    $resourceRollbackModuleSource.Contains("'DescendantUserAccess'") -and
+    $resourceRollbackModuleSource.Contains('DelegationRuleTypes') -and
+    $resourceRollbackModuleSource.Contains('Get-ADGroupMember @adContext -Identity $item.DistinguishedName') -and
+    $resourceRollbackModuleSource.Contains('$item.UndoData.GeneratedDescription') -and
+    $resourceRollbackModuleSource.Contains('-SearchScope OneLevel -ResultSetSize 1') -and
+    $resourceRollbackModuleSource.Contains('ProtectedFromAccidentalDeletion $true') -and
+    $resourceRollbackModuleSource.Contains('-Confirm:$false -ErrorAction Stop') -and
+    -not $resourceRollbackSource.Contains('Get-Acl') -and
+    -not $resourceRollbackSource.Contains('Remove-ADOrganizationalUnit')
+Assert-True $resourceRollbackIsCentralized `
+    'Provisioning delegates resource rollback to the shared ledger while retaining group, delegation, and OU safeguards'
 $runLevelCatch = $provisioningScriptAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.CatchClauseAst] -and
@@ -430,6 +559,17 @@ $adminGroupLedgerIndex = $adminGroupCreationSource.IndexOf('Add-ResourceLedgerEn
 $adminGroupLookupIndex = $adminGroupCreationSource.IndexOf('Get-ADGroup @adContext -Identity $createdAdministratorGroup.DistinguishedName', [System.StringComparison]::Ordinal)
 Assert-True ($adminGroupLedgerIndex -ge 0 -and $adminGroupLookupIndex -gt $adminGroupLedgerIndex) `
     'New department administrator groups enter the rollback ledger before follow-up directory reads'
+$ledgerAdapter = $provisioningScriptAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Add-ResourceLedgerEntry'
+}, $true)
+$ledgerAdapterSource = if ($ledgerAdapter) { $ledgerAdapter.Extent.Text } else { '' }
+Assert-True ($ledgerAdapterSource.Contains('Add-ADAutoXLedgerEntry') -and
+    $ledgerAdapterSource.Contains("'OrganizationalUnit' { 'OU' }") -and
+    $ledgerAdapterSource.Contains('-RunId $CorrelationId') -and
+    $ledgerAdapterSource.Contains('GeneratedDescription = $generatedOUDescription')) `
+    'Provisioning resource ledger compatibility adapter delegates all entries to the shared writer and preserves rollback metadata'
 $delegationGrant = $provisioningScriptAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Grant-DepartmentUserDelegation' }, $true)
 $delegationGrantSource = if ($delegationGrant) { $delegationGrant.Extent.Text } else { '' }
 $childRuleLedgerIndex = $delegationGrantSource.IndexOf('Add-ResourceLedgerEntry -Type ''Delegation'' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `', [System.StringComparison]::Ordinal)
@@ -515,12 +655,85 @@ $reversibleLifecycleActionsAreTracked = $lifecycleModuleSource.Contains("-Action
 Assert-True $reversibleLifecycleActionsAreTracked `
     'Reversible lifecycle changes record inverse state for enablement, moves, membership, descriptions, and attributes'
 
+$lifecycleTokens = $null
+$lifecycleParseErrors = $null
+$lifecycleAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $repoRoot 'Modules\ADAutoX.Lifecycle.psm1'),
+    [ref]$lifecycleTokens,
+    [ref]$lifecycleParseErrors
+)
+$protectedHelperAst = $lifecycleAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Test-ADAutoXProtectedAccount'
+}, $true)
+$protectedHelperSource = if ($protectedHelperAst) { $protectedHelperAst.Extent.Text } else { '' }
+$protectedConditions = @(
+    'AdminCount'
+    'IsCriticalSystemObject'
+    'Domain Admins'
+    'Enterprise Admins'
+    'Schema Admins'
+    'Administrators'
+    'Account Operators'
+    'Backup Operators'
+    'Administrator'
+    'Guest'
+    'krbtgt'
+    'WindowsIdentity]::GetCurrent'
+    'ProtectedFromAccidentalDeletion'
+)
+$protectedConditionsPresent = @($protectedConditions | Where-Object {
+    $protectedHelperSource.Contains($_)
+}).Count -eq $protectedConditions.Count
+$deletionProtectionIsScoped = $protectedHelperSource -match '(?s)if \(\$Action -in @\(''Terminate'', ''Delete''\)\).*?ProtectedFromAccidentalDeletion'
+Assert-True (@($lifecycleParseErrors).Count -eq 0 -and $protectedConditionsPresent -and $deletionProtectionIsScoped) `
+    'Protected-account implementation contains all configured checks and scopes deletion protection to delete/terminate'
+
+$dispatcherAst = $lifecycleAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-ADAutoXUserLifecycle'
+}, $true)
+$dispatcherSource = if ($dispatcherAst) { $dispatcherAst.Extent.Text } else { '' }
+$dispatcherGuardIndex = $dispatcherSource.IndexOf('Test-ADAutoXProtectedAccount', [System.StringComparison]::Ordinal)
+$mutationCommandNames = @('Disable-ADAccount', 'Set-ADAccountPassword', 'Move-ADObject', 'Remove-ADUser', 'Add-ADGroupMember', 'Remove-ADGroupMember')
+$mutationCommands = @($dispatcherAst.Body.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.CommandAst] -and
+    $node.GetCommandName() -in $mutationCommandNames
+}, $true))
+$guardPrecedesMutations = $dispatcherGuardIndex -ge 0 -and $mutationCommands.Count -gt 0 -and
+    @($mutationCommands | Where-Object { $_.Extent.StartOffset -le ($dispatcherAst.Extent.StartOffset + $dispatcherGuardIndex) }).Count -eq 0
+$dispatcherAuditsGuard = $dispatcherSource.Contains('Blocked protected-account action') -and
+    $dispatcherSource.Contains('Refusing action') -and
+    $dispatcherSource.Contains('WARNING: -AllowProtectedAccount bypassed') -and
+    $dispatcherSource.Contains('[switch]$AllowProtectedAccount')
+Assert-True ($guardPrecedesMutations -and $dispatcherAuditsGuard) `
+    'Lifecycle dispatcher checks protected accounts before mutations, audits refusal, and warns on explicit bypass'
+
+$inactiveDisableAst = $lifecycleAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Disable-ADAutoXInactiveUsers'
+}, $true)
+$inactiveDisableSource = if ($inactiveDisableAst) { $inactiveDisableAst.Extent.Text } else { '' }
+$inactiveDisableGuarded = $inactiveDisableSource.Contains('Test-ADAutoXProtectedAccount') -and
+    $inactiveDisableSource.Contains('AllowProtectedAccount') -and
+    $inactiveDisableSource.Contains('Blocked protected-account action')
+Assert-True $inactiveDisableGuarded `
+    'Inactive-account disabling uses the protected-account guard and explicit bypass'
+
 $manageUserSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\Manage-ADAutoXUser.ps1'))
+$manageUserAlias = Get-Command Manage-ADAutoXUser -ErrorAction SilentlyContinue
 $manageUserExposesPhase1Actions = $manageUserSource.Contains("[ValidateSet('Disable', 'Enable', 'Unlock', 'Move', 'RemoveFromGroup', 'ResetPassword', 'Terminate')]") -and
     $manageUserSource.Contains("if (`$PSBoundParameters.ContainsKey('Group')) { `$arguments.Group = `$Group }") -and
-    $manageUserSource.Contains('Invoke-ADAutoXUserLifecycle @arguments')
+    $manageUserSource.Contains('Invoke-ADAutoXUserAction @arguments') -and
+    $null -ne $manageUserAlias -and
+    $manageUserAlias.CommandType -eq 'Alias' -and
+    $manageUserAlias.Definition -eq 'Invoke-ADAutoXUserAction'
 Assert-True $manageUserExposesPhase1Actions `
-    'User manager exposes Phase 1 lifecycle actions and forwards group membership input'
+    'User manager calls the approved action function and preserves its compatibility alias'
 
 $legacyLifecycleNames = @(
     'Script_Disable_Inactive_Users.ps1','Script_Disable_User.ps1','Script_Enable_User.ps1',

@@ -626,55 +626,14 @@ function Test-ADProvisioningPreflight {
         [psobject]$State
     )
 
-    $checks = [System.Collections.Generic.List[psobject]]::new()
-
-    if (-not (Get-Command Get-ADDomain -ErrorAction SilentlyContinue)) {
-        Add-ADPreflightCheck -Checks $checks -Name 'AD module' -Status 'Failed' -Details 'Active Directory module not available.'
-    }
-    else {
-        Add-ADPreflightCheck -Checks $checks -Name 'AD module' -Status 'Passed' -Details 'Active Directory module loaded.'
-    }
-
-    try {
-        $null = Get-ADDomain @script:adContext -ErrorAction Stop
-        Add-ADPreflightCheck -Checks $checks -Name 'Domain connectivity' -Status 'Passed' -Details "Domain root resolved to '$($State.DomainRoot)'."
-    }
-    catch {
-        Add-ADPreflightCheck -Checks $checks -Name 'Domain connectivity' -Status 'Failed' -Details $_.Exception.Message
-    }
-
-    # The names file is only consumed when standard accounts are generated.
-    if ($State.AdministratorsOnly) {
-        Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Passed' -Details 'Not required for an administrators-only run.'
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($State.NamesPath) -and -not (Test-Path -LiteralPath $State.NamesPath -PathType Leaf)) {
-        Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Failed' -Details "Names file not found: $($State.NamesPath)"
-    }
-    else {
-        Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Passed' -Details "Names file resolved to '$($State.NamesPath)'."
-    }
-
-    foreach ($department in $State.Departments) {
-        $departmentName = $department.Trim()
-        Add-ADPreflightCheck -Checks $checks -Name "Department name: $departmentName" -Status 'Passed' -Details "Validated department '$departmentName'."
-    }
-
-    if ($State.CreateDepartmentAdministrators -and -not [string]::IsNullOrWhiteSpace($State.AdministratorUsername) -and $State.Departments.Count -gt 1 -and -not $State.AdministratorUsername.Contains('{0}')) {
-        Add-ADPreflightCheck -Checks $checks -Name 'Administrator username template' -Status 'Failed' -Details "When creating department administrators for multiple departments, -AdministratorUsername must include {0}."
-    }
-    else {
-        Add-ADPreflightCheck -Checks $checks -Name 'Administrator username template' -Status 'Passed' -Details 'Administrator naming pattern is valid for the requested department layout.'
-    }
-
-    $summary = [pscustomobject]@{
-        Passed = (@($checks | Where-Object { $_.Status -eq 'Passed' }).Count -gt 0) -and (@($checks | Where-Object { $_.Status -eq 'Failed' }).Count -eq 0)
-        PassedCount = @($checks | Where-Object { $_.Status -eq 'Passed' }).Count
-        NeedsAttentionCount = @($checks | Where-Object { $_.Status -eq 'NeedsAttention' }).Count
-        FailedCount = @($checks | Where-Object { $_.Status -eq 'Failed' }).Count
-        Checks = $checks.ToArray()
-    }
-
-    return $summary
+    Invoke-ADAutoXPreflight `
+        -CompanyOuName $State.OrganizationalUnitName `
+        -StaffOuName $State.StaffNamesOrganizationalUnitName `
+        -Departments $State.Departments `
+        -DomainDN $State.DomainRoot `
+        -NetBIOSName $State.DomainNetBIOSName `
+        -State $State `
+        -ADContext $State.ADContext
 }
 
 function Test-ADProvisioningTargetPermissions {
@@ -1139,7 +1098,7 @@ function New-DepartmentAdministrator {
 }
 
 function Set-DepartmentDelegation {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Low')]
     param(
         [Parameter(Mandatory)]
         [psobject]$State,
@@ -1188,6 +1147,18 @@ function Set-DepartmentDelegation {
 
     if ($alreadyGranted) {
         return [pscustomobject]@{ GroupName = $GroupName; TargetOuDistinguishedName = $TargetOuDistinguishedName; Status = 'AlreadyPresent' }
+    }
+
+    if (-not $PSCmdlet.ShouldProcess(
+        $TargetOuDistinguishedName,
+        "Grant scoped user-object delegation to '$GroupName'"
+    )) {
+        $status = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
+        return [pscustomobject]@{
+            GroupName = $GroupName
+            TargetOuDistinguishedName = $TargetOuDistinguishedName
+            Status = $status
+        }
     }
 
     $childManagementRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
@@ -1319,7 +1290,7 @@ function Export-ProvisioningReport {
 }
 
 function Invoke-ProvisioningRollback {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Low')]
     param(
         [Parameter(Mandatory)]
         [psobject]$State
@@ -1334,9 +1305,17 @@ function Invoke-ProvisioningRollback {
 
     $removedCount = 0
     $failedCount = 0
+    $skippedCount = 0
     foreach ($createdAccount in $State.CreatedAccounts) {
         try {
             Assert-ADTargetWithinRoot -Target $createdAccount.DistinguishedName -AllowedRoot $allowedRoot
+            if (-not $PSCmdlet.ShouldProcess(
+                $createdAccount.DistinguishedName,
+                'Remove account created during provisioning rollback'
+            )) {
+                $skippedCount++
+                continue
+            }
             Remove-ADUser @script:adContext -Identity $createdAccount.DistinguishedName -Confirm:$false -ErrorAction Stop
             $removedCount++
         }
@@ -1348,7 +1327,13 @@ function Invoke-ProvisioningRollback {
         }
     }
 
-    return [pscustomobject]@{ RolledBack = ($failedCount -eq 0); AccountsRemoved = $removedCount; AccountsFailed = $failedCount; Preview = $false }
+    return [pscustomobject]@{
+        RolledBack = ($failedCount -eq 0 -and $skippedCount -eq 0)
+        AccountsRemoved = $removedCount
+        AccountsFailed = $failedCount
+        AccountsSkipped = $skippedCount
+        Preview = [bool]$WhatIfPreference
+    }
 }
 
 Export-ModuleMember -Function 'Test-DepartmentNames', 'Get-ADInvocationContext', 'New-RandomPassword', 'Test-PasswordComplexity', 'Resolve-PasswordPatternText', 'Get-UniqueSamAccountName', 'Get-ADFailureCategory', 'Get-ADCreateFailureDetails', 'Initialize-ADProvisioning', 'Clear-ADProvisioningContext', 'Test-ADProvisioningPreflight', 'Test-ADProvisioningTargetPermissions', 'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser', 'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation', 'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback'

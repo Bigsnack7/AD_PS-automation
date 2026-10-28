@@ -67,21 +67,139 @@ function Get-ADAutoXSecurityScan {
     param(
         [string]$SearchBase,
         [ValidateRange(1,3650)][int]$InactiveDays = 90,
+        [string]$DomainName,
+        [ValidateNotNullOrEmpty()][string[]]$Departments = @('IT', 'HR', 'Finance', 'Sales'),
+        [string]$OrganizationalUnitName = '',
         [string]$Server,
-        [PSCredential]$Credential
+        [PSCredential]$Credential,
+        [string]$AuditLogPath = ''
     )
 
+    if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
+        $AuditLogPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'AD-Operations.jsonl'
+    }
+
     Import-ADTools
+    $reportTarget = if ($SearchBase) { $SearchBase } else { 'Domain' }
     try {
         $null = Set-ADToolContext -Server $Server -Credential $Credential
         $adContext = Get-ADToolContextParameters
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'SecurityReport' -Target $reportTarget -Status 'Started'
+
+        $domain = Get-ADDomain @adContext -ErrorAction Stop
+        $resolvedDomainName = if ($DomainName) { $DomainName } else { $domain.DNSRoot }
+        $effectiveSearchBase = $SearchBase
+        if (-not $effectiveSearchBase -and $OrganizationalUnitName) {
+            $companyOuFilter = "(ou=$(ConvertTo-LdapFilterValue $OrganizationalUnitName))"
+            $companyOu = @(Get-ADOrganizationalUnit @adContext -LDAPFilter $companyOuFilter `
+                -SearchBase $domain.DistinguishedName -SearchScope OneLevel -ErrorAction Stop)
+            if ($companyOu.Count -gt 1) {
+                throw "More than one OU named '$OrganizationalUnitName' was found below '$($domain.DistinguishedName)'. Specify -SearchBase to select the intended scope."
+            }
+            if ($companyOu.Count -gt 0) { $effectiveSearchBase = $companyOu[0].DistinguishedName }
+        }
+        if (-not $effectiveSearchBase) { $effectiveSearchBase = $domain.DistinguishedName }
+
         $query = @{}
-        if ($SearchBase) { $query.SearchBase = $SearchBase; $query.SearchScope = 'Subtree' }
+        $query.SearchBase = $effectiveSearchBase
+        $query.SearchScope = 'Subtree'
+        $usersInScope = @(Get-ADUser @adContext @query -Filter * -Properties SamAccountName,Department,DistinguishedName,Enabled,LockedOut,PasswordNeverExpires,LastLogonDate,WhenChanged,WhenCreated -ErrorAction Stop)
         $lockedUsers = @(Get-ADUser @adContext @query -Filter 'LockedOut -eq $true' -Properties LockedOut, AccountExpirationDate, LastLogonDate, Department -ErrorAction Stop)
         $neverExpires = @(Get-ADUser @adContext @query -Filter 'PasswordNeverExpires -eq $true' -Properties PasswordNeverExpires, Enabled, Department -ErrorAction Stop)
         $threshold = (Get-Date).AddDays(-$InactiveDays)
         $inactiveUsers = @(Get-ADUser @adContext @query -Filter 'Enabled -eq $true' -Properties LastLogonDate, WhenCreated, Department -ErrorAction Stop |
             Where-Object { Test-ADAccountInactive -User $_ -Cutoff $threshold })
+
+        function Get-ADAutoXSecurityReportGroupMembers {
+            param([Parameter(Mandatory)][string]$GroupName)
+
+            try {
+                $group = Get-ADGroup @adContext -Identity $GroupName -ErrorAction Stop
+            }
+            catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
+                return @()
+            }
+            return @(Get-ADGroupMember @adContext -Identity $group -Recursive -ErrorAction Stop |
+                Where-Object { $_.ObjectClass -eq 'user' })
+        }
+
+        $privilegedUserNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $privilegedGroupNames = @('Administrators', 'Domain Admins', 'Enterprise Admins', 'Schema Admins', 'Backup Operators')
+        foreach ($groupName in $privilegedGroupNames) {
+            foreach ($member in @(Get-ADAutoXSecurityReportGroupMembers -GroupName $groupName)) {
+                if ($member.SamAccountName) { [void]$privilegedUserNames.Add([string]$member.SamAccountName) }
+            }
+        }
+        foreach ($user in $usersInScope) {
+            if ($user.Department -and $user.Department -in $Departments) {
+                $departmentGroupName = "$($user.Department)-Administrators"
+                foreach ($member in @(Get-ADAutoXSecurityReportGroupMembers -GroupName $departmentGroupName)) {
+                    if ($member.SamAccountName) { [void]$privilegedUserNames.Add([string]$member.SamAccountName) }
+                }
+            }
+        }
+        $privilegedUsers = @($privilegedUserNames | Sort-Object)
+        $departmentAdminCounts = @{}
+        foreach ($department in $Departments) {
+            $departmentAdminCounts[$department] = @(Get-ADAutoXSecurityReportGroupMembers -GroupName "$department-Administrators").Count
+        }
+
+        $recentWindow = (Get-Date).AddDays(-7)
+        $inactiveCutoff = (Get-Date).AddDays(-90)
+        $inactiveAccountCount = @($usersInScope | Where-Object {
+            Test-ADAccountInactive -User $_ -Cutoff $inactiveCutoff
+        }).Count
+        $disabledAccountCount = @($usersInScope | Where-Object { $_.Enabled -eq $false }).Count
+        $lockedAccountCount = @($usersInScope | Where-Object { $_.LockedOut -eq $true }).Count
+        $passwordNeverExpiresCount = @($usersInScope | Where-Object { $_.PasswordNeverExpires -eq $true }).Count
+        $accountsCreated = @($usersInScope | Where-Object { $_.WhenCreated -and $_.WhenCreated -ge $recentWindow }).Count
+        $accountsModified = @($usersInScope | Where-Object { $_.WhenChanged -and $_.WhenChanged -ge $recentWindow }).Count
+        $reportLines = @(
+            'ACTIVE DIRECTORY SECURITY REPORT'
+            '================================'
+            ''
+            "Domain: $resolvedDomainName"
+            ''
+            'Privileged Users:'
+        )
+        $privilegedUsersDisplay = if ($privilegedUsers.Count -eq 0) { @('None') } else { $privilegedUsers }
+        $reportLines += @($privilegedUsersDisplay | ForEach-Object { "  $_" })
+        $reportLines += @(
+            ''
+            'Total Accounts In Scope:'
+            "  $($usersInScope.Count)"
+            ''
+            'Disabled Accounts:'
+            "  $disabledAccountCount"
+            ''
+            'Locked Accounts:'
+            "  $lockedAccountCount"
+            ''
+            'Password Never Expires:'
+            "  $passwordNeverExpiresCount"
+            ''
+            'Inactive Accounts (90+ days, including never-logged-on accounts created before cutoff):'
+            "  $inactiveAccountCount"
+            ''
+            'Department Administrators:'
+        )
+        foreach ($department in $Departments) {
+            $reportLines += "  {0}: {1}" -f $department, $departmentAdminCounts[$department]
+        }
+        $reportLines += @(
+            ''
+            'Accounts Created (last 7 days):'
+            "  $accountsCreated"
+            ''
+            'Accounts Modified (last 7 days):'
+            "  $accountsModified"
+            ''
+            'Report Generated:'
+            "  $(Get-Date -Format 'yyyy-MM-dd')"
+        )
+
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'SecurityReport' -Target $reportTarget -Status 'Succeeded' `
+            -Message "Privileged users: $($privilegedUsers.Count); disabled: $disabledAccountCount; locked: $lockedAccountCount; password-never-expires: $passwordNeverExpiresCount; inactive: $inactiveAccountCount; accounts created: $accountsCreated; accounts modified: $accountsModified."
         [pscustomobject]@{
             Timestamp = (Get-Date).ToUniversalTime().ToString('o')
             LockedOutAccountsCount = $lockedUsers.Count
@@ -90,7 +208,21 @@ function Get-ADAutoXSecurityScan {
             LockedUsers = $lockedUsers
             NeverExpiresUsers = $neverExpires
             InactiveUsers = $inactiveUsers
+            DomainName = $resolvedDomainName
+            PrivilegedUsers = $privilegedUsers
+            TotalAccountsCount = $usersInScope.Count
+            DisabledAccountsCount = $disabledAccountCount
+            LockedAccountsCount = $lockedAccountCount
+            PasswordNeverExpiresAccountsCount = $passwordNeverExpiresCount
+            AccountsCreatedLast7Days = $accountsCreated
+            AccountsModifiedLast7Days = $accountsModified
+            DepartmentAdminCounts = $departmentAdminCounts
+            ReportLines = $reportLines
         }
+    }
+    catch {
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'SecurityReport' -Target $reportTarget -Status 'Failed' -Message $_.Exception.Message
+        throw
     }
     finally { Clear-ADToolContext }
 }
@@ -267,12 +399,16 @@ function Get-ADAutoXLedger {
 function Add-ADAutoXLedgerEntry {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('OU', 'Group', 'User', 'Lifecycle')][string]$ObjectType,
+        [Parameter(Mandatory)][ValidateSet('OU', 'Group', 'User', 'Delegation', 'Lifecycle')][string]$ObjectType,
         [string]$DistinguishedName,
         [string]$SamAccountName,
+        [string]$Name,
         [ValidateSet('RestoreEnabled', 'MoveUser', 'GroupMembership', 'RestoreDescription', 'RestoreAttributes')]
         [string]$Action,
         [hashtable]$UndoData,
+        [string]$SecurityIdentifier,
+        [string[]]$DelegationRuleTypes = @(),
+        [string]$RunId = '',
         [bool]$CreatedByThisRun = $true
     )
     if ($ObjectType -eq 'Lifecycle') {
@@ -283,23 +419,41 @@ function Add-ADAutoXLedgerEntry {
         if (-not $SamAccountName) { $SamAccountName = [string]$UndoData.SamAccountName }
         $CreatedByThisRun = $false
     }
-    elseif ([string]::IsNullOrWhiteSpace($DistinguishedName) -or [string]::IsNullOrWhiteSpace($SamAccountName)) {
-        throw 'Created-resource ledger entries require a distinguished name and SAM account name.'
+    elseif ([string]::IsNullOrWhiteSpace($DistinguishedName)) {
+        throw 'Created-resource ledger entries require a distinguished name.'
+    }
+    elseif ($ObjectType -eq 'Delegation') {
+        if ([string]::IsNullOrWhiteSpace($SecurityIdentifier)) {
+            throw 'Delegation ledger entries require the delegated security identifier.'
+        }
+        if ($CreatedByThisRun -and $DelegationRuleTypes.Count -eq 0) {
+            throw 'Run-created delegation entries require exact delegation-rule ownership data.'
+        }
+    }
+    if (-not $Name) {
+        $Name = if ($SamAccountName) { $SamAccountName } else { $DistinguishedName }
     }
     $script:ADAutoXLedgerSequence++
-    $script:ADAutoXLedger.Add([pscustomobject]@{
+    $entry = [pscustomobject]@{
         ObjectType = $ObjectType
         DistinguishedName = $DistinguishedName
         SamAccountName = $SamAccountName
+        Name = $Name
         CreatedByThisRun = $CreatedByThisRun
         Action = $Action
         UndoData = $UndoData
+        SecurityIdentifier = $SecurityIdentifier
+        DelegationRuleTypes = @($DelegationRuleTypes)
+        RunId = $RunId
         Sequence = $script:ADAutoXLedgerSequence
         Timestamp = (Get-Date).ToUniversalTime().ToString('o')
-    })
+    }
+    $script:ADAutoXLedger.Add($entry)
+    return $entry
 }
 
 function Invoke-ADAutoXLifecycleUndo {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
         [Parameter(Mandatory)][psobject]$Entry,
         [Parameter(Mandatory)][hashtable]$ADContext,
@@ -315,6 +469,9 @@ function Invoke-ADAutoXLifecycleUndo {
         'RestoreEnabled' {
             if ([bool]$user.Enabled -ne [bool]$undo.ExpectedEnabled) {
                 throw "Account enabled state changed since the ledger entry was recorded for '$($user.SamAccountName)'; refusing to overwrite the newer state."
+            }
+            if (-not $PSCmdlet.ShouldProcess($user.DistinguishedName, 'Restore account enabled state')) {
+                return $false
             }
             if ([bool]$undo.RestoreEnabled) {
                 Enable-ADAccount @ADContext -Identity $user -Confirm:$false -ErrorAction Stop
@@ -333,6 +490,9 @@ function Invoke-ADAutoXLifecycleUndo {
                 throw "Account location changed since the ledger entry was recorded for '$($user.SamAccountName)'; refusing to move it."
             }
             Assert-ADTargetWithinRoot -Target ([string]$undo.RestoreParent) -AllowedRoot $AllowedRoot
+            if (-not $PSCmdlet.ShouldProcess($user.DistinguishedName, "Restore account location to '$($undo.RestoreParent)'")) {
+                return $false
+            }
             Move-ADObject @ADContext -Identity $user -TargetPath ([string]$undo.RestoreParent) -Confirm:$false -ErrorAction Stop
             $verified = Get-ADUser @ADContext -Identity ([Guid]$undo.UserIdentity) -Properties DistinguishedName -ErrorAction Stop
             $verifiedParent = Get-ADDistinguishedNameParent -DistinguishedName $verified.DistinguishedName
@@ -347,6 +507,15 @@ function Invoke-ADAutoXLifecycleUndo {
                 Where-Object { $_.SID -eq $user.SID }).Count -gt 0
             if ($isMember -ne [bool]$undo.ExpectedMembership) {
                 throw "Group membership changed since the ledger entry was recorded for '$($user.SamAccountName)' and '$($group.Name)'; refusing to overwrite the newer state."
+            }
+            $membershipOperation = if ([bool]$undo.RestoreMembership) {
+                "Restore membership in '$($group.Name)'"
+            }
+            else {
+                "Restore removal from '$($group.Name)'"
+            }
+            if (-not $PSCmdlet.ShouldProcess($user.DistinguishedName, $membershipOperation)) {
+                return $false
             }
             if ([bool]$undo.RestoreMembership) {
                 Add-ADGroupMember @ADContext -Identity $group -Members $user -Confirm:$false -ErrorAction Stop
@@ -363,6 +532,9 @@ function Invoke-ADAutoXLifecycleUndo {
         'RestoreDescription' {
             if ([string]$user.Description -cne [string]$undo.ExpectedDescription) {
                 throw "Account description changed since the ledger entry was recorded for '$($user.SamAccountName)'; refusing to overwrite the newer value."
+            }
+            if (-not $PSCmdlet.ShouldProcess($user.DistinguishedName, 'Restore account description')) {
+                return $false
             }
             if ([string]::IsNullOrEmpty([string]$undo.RestoreDescription)) {
                 Set-ADUser @ADContext -Identity $user -Clear Description -Confirm:$false -ErrorAction Stop
@@ -395,6 +567,9 @@ function Invoke-ADAutoXLifecycleUndo {
             $setParameters = @{ Identity = $user; Confirm = $false; ErrorAction = 'Stop' }
             foreach ($attribute in $setAttributes.Keys) { $setParameters[$attribute] = $setAttributes[$attribute] }
             if ($clearAttributes.Count -gt 0) { $setParameters.Clear = $clearAttributes.ToArray() }
+            if (-not $PSCmdlet.ShouldProcess($user.DistinguishedName, 'Restore account attributes')) {
+                return $false
+            }
             Set-ADUser @ADContext @setParameters
             $verified = Get-ADUser @ADContext -Identity ([Guid]$undo.UserIdentity) -Properties Department,Company -ErrorAction Stop
             foreach ($attribute in @('Department', 'Company')) {
@@ -405,6 +580,7 @@ function Invoke-ADAutoXLifecycleUndo {
         }
         default { throw "Unsupported lifecycle undo action '$($Entry.Action)'." }
     }
+    return $true
 }
 
 function Invoke-ADAutoXLedgerRollback {
@@ -412,7 +588,9 @@ function Invoke-ADAutoXLedgerRollback {
     param(
         [string]$LogPath = '',
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AllowedRoot,
+        [string]$RunId = '',
         [switch]$AllowDestructiveOperation,
+        [hashtable]$ADContext,
         [string]$Server,
         [PSCredential]$Credential
     )
@@ -420,32 +598,51 @@ function Invoke-ADAutoXLedgerRollback {
     if (-not $WhatIfPreference -and -not $AllowDestructiveOperation) {
         throw 'Live rollback requires -AllowDestructiveOperation. Preview with -WhatIf first.'
     }
-    $lifecycleItems = @($script:ADAutoXLedger |
-        Where-Object ObjectType -eq 'Lifecycle' |
-        Sort-Object Sequence -Descending)
-    $items = @($lifecycleItems + @($script:ADAutoXLedger | Where-Object {
-        $_.ObjectType -ne 'Lifecycle' -and $_.CreatedByThisRun
-    }))
+    $lifecycleItems = if ([string]::IsNullOrWhiteSpace($RunId)) {
+        @($script:ADAutoXLedger | Where-Object ObjectType -eq 'Lifecycle' | Sort-Object Sequence -Descending)
+    }
+    else { @() }
+    $resourceItems = @($script:ADAutoXLedger | Where-Object {
+        $_.ObjectType -ne 'Lifecycle' -and $_.CreatedByThisRun -and
+        ([string]::IsNullOrWhiteSpace($RunId) -or $_.RunId -ceq $RunId)
+    })
+    $items = @($lifecycleItems + $resourceItems)
     if ($items.Count -eq 0) {
         return [pscustomobject]@{ RolledBack = $false; RestoredCount = 0; RemovedCount = 0; FailedCount = 0; Results = @() }
     }
 
-    Import-ADTools
+    $ownsContext = -not $PSBoundParameters.ContainsKey('ADContext')
+    if ($ownsContext) {
+        Import-ADTools
+    }
     $results = [System.Collections.Generic.List[object]]::new()
     try {
-        $null = Set-ADToolContext -Server $Server -Credential $Credential
-        $adContext = Get-ADToolContextParameters
+        if ($ownsContext) {
+            $null = Set-ADToolContext -Server $Server -Credential $Credential
+            $adContext = Get-ADToolContextParameters
+        }
+        else {
+            $adContext = $ADContext
+        }
         foreach ($item in $lifecycleItems) {
             $mutationCompleted = $false
             $target = if ($item.DistinguishedName) { $item.DistinguishedName } else { $item.SamAccountName }
             try {
-                $operation = "Restore lifecycle change '$($item.Action)'"
-                if (-not $PSCmdlet.ShouldProcess($target, $operation)) {
+                $undoParameters = @{
+                    Entry = $item
+                    ADContext = $adContext
+                    AllowedRoot = $AllowedRoot
+                    WhatIf = [bool]$WhatIfPreference
+                }
+                if ($PSBoundParameters.ContainsKey('Confirm')) {
+                    $undoParameters.Confirm = $PSBoundParameters['Confirm']
+                }
+                $undoApplied = Invoke-ADAutoXLifecycleUndo @undoParameters
+                if (-not $undoApplied) {
                     $status = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
                     $results.Add([pscustomobject]@{ ObjectType = 'Lifecycle'; Action = $item.Action; Identity = $item.SamAccountName; Status = $status })
                     continue
                 }
-                Invoke-ADAutoXLifecycleUndo -Entry $item -ADContext $adContext -AllowedRoot $AllowedRoot
                 $mutationCompleted = $true
                 $null = $script:ADAutoXLedger.Remove($item)
                 $results.Add([pscustomobject]@{ ObjectType = 'Lifecycle'; Action = $item.Action; Identity = $item.SamAccountName; Status = 'Succeeded' })
@@ -468,9 +665,10 @@ function Invoke-ADAutoXLedgerRollback {
             }
         }
         $orderedItems = @(
-            @($items | Where-Object ObjectType -eq 'User')
-            @($items | Where-Object ObjectType -eq 'Group')
-            @($items | Where-Object ObjectType -eq 'OU' | Sort-Object {
+            @($resourceItems | Where-Object ObjectType -eq 'User')
+            @($resourceItems | Where-Object ObjectType -eq 'Delegation')
+            @($resourceItems | Where-Object ObjectType -eq 'Group')
+            @($resourceItems | Where-Object ObjectType -eq 'OU' | Sort-Object {
                 - (Get-ADDistinguishedNameDepth -DistinguishedName $_.DistinguishedName)
             })
         )
@@ -491,10 +689,98 @@ function Invoke-ADAutoXLedgerRollback {
                 }
 
                 switch ($item.ObjectType) {
-                    'User' { Remove-ADUser @adContext -Identity $item.DistinguishedName -Confirm:$false -ErrorAction Stop }
-                    'Group' { Remove-ADGroup @adContext -Identity $item.DistinguishedName -Confirm:$false -ErrorAction Stop }
+                    'User' {
+                        $existingUserObject = Get-ADObject @adContext -Identity $item.DistinguishedName -ErrorAction SilentlyContinue
+                        if ($existingUserObject) {
+                            Remove-ADUser @adContext -Identity $item.DistinguishedName -Confirm:$false -ErrorAction Stop
+                        }
+                    }
+                    'Delegation' {
+                        if ([string]::IsNullOrWhiteSpace($item.SecurityIdentifier) -or
+                            $item.DelegationRuleTypes.Count -eq 0) {
+                            throw "Delegation '$($item.Name)' is missing exact ACL ownership data; refusing a broad ACL change."
+                        }
+
+                        $groupSid = [System.Security.Principal.SecurityIdentifier]::new($item.SecurityIdentifier)
+                        $userClassGuid = [Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
+                        $childManagementRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
+                            [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild
+                        $managedAccessRights = $childManagementRights -bor
+                            [System.DirectoryServices.ActiveDirectoryRights]::ListChildren -bor
+                            [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
+                            [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
+                            [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
+                        $ouPath = "AD:\$($item.DistinguishedName)"
+                        $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+                        $rulesToRemove = @($acl.Access | Where-Object {
+                            $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                            $ruleSid -eq $groupSid.Value -and
+                            -not $_.IsInherited -and
+                            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                            (
+                                (('ChildManagement' -in $item.DelegationRuleTypes) -and
+                                    $_.ActiveDirectoryRights -eq $childManagementRights -and
+                                    $_.ObjectType -eq $userClassGuid -and
+                                    $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None -and
+                                    $_.InheritedObjectType -eq [Guid]::Empty) -or
+                                (('DescendantUserAccess' -in $item.DelegationRuleTypes) -and
+                                    $_.ActiveDirectoryRights -eq $managedAccessRights -and
+                                    $_.ObjectType -eq $userClassGuid -and
+                                    $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
+                                    $_.InheritedObjectType -eq $userClassGuid)
+                            )
+                        })
+                        foreach ($rule in $rulesToRemove) {
+                            $acl.RemoveAccessRuleSpecific($rule)
+                        }
+                        if ($rulesToRemove.Count -gt 0) {
+                            Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
+                        }
+                        $verifiedAcl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+                        $remainingRules = @($verifiedAcl.Access | Where-Object {
+                            $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                            $ruleSid -eq $groupSid.Value -and
+                            -not $_.IsInherited -and
+                            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                            (
+                                (('ChildManagement' -in $item.DelegationRuleTypes) -and
+                                    $_.ActiveDirectoryRights -eq $childManagementRights -and
+                                    $_.ObjectType -eq $userClassGuid -and
+                                    $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None -and
+                                    $_.InheritedObjectType -eq [Guid]::Empty) -or
+                                (('DescendantUserAccess' -in $item.DelegationRuleTypes) -and
+                                    $_.ActiveDirectoryRights -eq $managedAccessRights -and
+                                    $_.ObjectType -eq $userClassGuid -and
+                                    $_.InheritanceType -eq [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents -and
+                                    $_.InheritedObjectType -eq $userClassGuid)
+                            )
+                        })
+                        if ($remainingRules.Count -gt 0) {
+                            throw "Run-created delegation rules remain on '$($item.DistinguishedName)'."
+                        }
+                    }
+                    'Group' {
+                        $remainingMembers = @(Get-ADGroupMember @adContext -Identity $item.DistinguishedName -ErrorAction Stop)
+                        if ($remainingMembers.Count -gt 0) {
+                            throw "Group '$($item.Name)' contains members; refusing to remove it."
+                        }
+                        Remove-ADGroup @adContext -Identity $item.DistinguishedName -Confirm:$false -ErrorAction Stop
+                    }
                     'OU' {
-                        $organizationalUnit = Get-ADOrganizationalUnit @adContext -Identity $item.DistinguishedName -Properties ProtectedFromAccidentalDeletion -ErrorAction Stop
+                        $expectedDescription = if ($item.UndoData) { [string]$item.UndoData.GeneratedDescription } else { '' }
+                        if ([string]::IsNullOrWhiteSpace($expectedDescription)) {
+                            throw "OU '$($item.DistinguishedName)' is missing its generated-resource marker; refusing to remove it."
+                        }
+                        $organizationalUnit = Get-ADOrganizationalUnit @adContext -Identity $item.DistinguishedName `
+                            -Properties Description,ProtectedFromAccidentalDeletion -ErrorAction Stop
+                        if ($organizationalUnit.Description -cne $expectedDescription) {
+                            throw "OU '$($item.DistinguishedName)' is not marked as created by this run; refusing to remove it."
+                        }
+                        $remainingObjects = @(Get-ADObject @adContext -Filter * -SearchBase $item.DistinguishedName `
+                            -SearchScope OneLevel -ResultSetSize 1 -ErrorAction Stop)
+                        if ($remainingObjects.Count -gt 0) {
+                            throw "OU '$($item.DistinguishedName)' contains objects; refusing to remove it."
+                        }
                         $wasProtected = [bool]$organizationalUnit.ProtectedFromAccidentalDeletion
                         if ($wasProtected) {
                             Set-ADOrganizationalUnit @adContext -Identity $item.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
@@ -511,9 +797,23 @@ function Invoke-ADAutoXLedgerRollback {
                         }
                     }
                 }
+                if ($item.ObjectType -in @('User', 'Group') -and
+                    (Get-ADObject @adContext -Identity $item.DistinguishedName -ErrorAction SilentlyContinue)) {
+                    throw "$($item.ObjectType) '$($item.DistinguishedName)' still exists after rollback removal."
+                }
+                if ($item.ObjectType -eq 'OU' -and
+                    (Get-ADOrganizationalUnit @adContext -Identity $item.DistinguishedName -ErrorAction SilentlyContinue)) {
+                    throw "OU '$($item.DistinguishedName)' still exists after rollback removal."
+                }
                 $mutationCompleted = $true
                 $null = $script:ADAutoXLedger.Remove($item)
-                $results.Add([pscustomobject]@{ ObjectType = $item.ObjectType; Identity = $item.SamAccountName; Status = 'Succeeded' })
+                $results.Add([pscustomobject]@{
+                    ObjectType = $item.ObjectType
+                    Identity = if ($item.SamAccountName) { $item.SamAccountName } else { $item.Name }
+                    SamAccountName = $item.SamAccountName
+                    DistinguishedName = $item.DistinguishedName
+                    Status = 'Succeeded'
+                })
                 if ($LogPath) {
                     Write-ADAutoXLogRecord -LogPath $LogPath -Action "Rollback$($item.ObjectType)" -Target $item.DistinguishedName -Status 'Succeeded'
                 }
@@ -529,11 +829,20 @@ function Invoke-ADAutoXLedgerRollback {
                         $message += " Audit logging also failed: $($_.Exception.Message)"
                     }
                 }
-                $results.Add([pscustomobject]@{ ObjectType = $item.ObjectType; Identity = $item.SamAccountName; Status = $status; Error = $message })
+                $results.Add([pscustomobject]@{
+                    ObjectType = $item.ObjectType
+                    Identity = if ($item.SamAccountName) { $item.SamAccountName } else { $item.Name }
+                    SamAccountName = $item.SamAccountName
+                    DistinguishedName = $item.DistinguishedName
+                    Status = $status
+                    Error = $message
+                })
             }
         }
     }
-    finally { Clear-ADToolContext }
+    finally {
+        if ($ownsContext) { Clear-ADToolContext }
+    }
 
     $failedCount = @($results | Where-Object Status -in @('Failed', 'CompletedWithErrors')).Count
     [pscustomobject]@{
@@ -556,57 +865,220 @@ function Invoke-ADAutoXPreflight {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$StaffOuName,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$Departments,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DomainDN,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$NetBIOSName
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$NetBIOSName,
+        [psobject]$State,
+        [hashtable]$ADContext
     )
 
     Write-ADAutoXConsole -Message 'Phase 1: Preflight Validation (Non-mutating)' -Level Phase
-    $checks = [System.Collections.Generic.List[object]]::new()
-
-    if (-not (Get-Command Get-ADOrganizationalUnit -ErrorAction SilentlyContinue)) {
-        Write-ADAutoXConsole -Message '[Offline/Preview] Active Directory module is unavailable. Simulating preflight checks.' -Level Warning
-        $checks.Add([pscustomobject]@{ Name = 'Company OU'; Status = 'NeedsAttention'; Details = "Root OU '$CompanyOuName' will be created during provisioning." })
-        $checks.Add([pscustomobject]@{ Name = 'Staff OU'; Status = 'NeedsAttention'; Details = "Staff OU '$StaffOuName' will be created during provisioning." })
-        foreach ($department in $Departments) {
-            $checks.Add([pscustomobject]@{ Name = "Department Structure: $department"; Status = 'Passed'; Details = "Validated target scope for $department." })
-        }
-        $summary = [pscustomobject]@{
-            PassedCount = @($checks | Where-Object Status -eq 'Passed').Count
-            NeedsAttentionCount = @($checks | Where-Object Status -eq 'NeedsAttention').Count
-            Checks = $checks.ToArray()
-        }
-        Write-ADAutoXConsole -Message "Preflight completed: $($summary.PassedCount) passed, $($summary.NeedsAttentionCount) pending creation." -Level Info
-        return $summary
+    $checks = [System.Collections.Generic.List[psobject]]::new()
+    $isCanonicalProvisioning = $State -and
+        $State.PSObject.Properties['CanonicalProvisioning'] -and
+        [bool]$State.CanonicalProvisioning
+    if (-not $ADContext -and (Get-Command Get-ADToolContextParameters -ErrorAction SilentlyContinue)) {
+        $ADContext = Get-ADToolContextParameters
     }
 
-    $companyFilterValue = ConvertTo-LdapFilterValue -Value $CompanyOuName
-    $companyOUs = @(Get-ADOrganizationalUnit -LDAPFilter "(ou=$companyFilterValue)" -SearchBase $DomainDN -SearchScope OneLevel -ErrorAction Stop)
-    $companyExists = $companyOUs.Count -eq 1
+    if ($State) {
+        if (-not (Get-Command Get-ADDomain -ErrorAction SilentlyContinue)) {
+            Add-ADPreflightCheck -Checks $checks -Name 'AD module' -Status 'Failed' -Details 'Active Directory module not available.'
+        }
+        else {
+            Add-ADPreflightCheck -Checks $checks -Name 'AD module' -Status 'Passed' -Details 'Active Directory module loaded.'
+        }
+
+        try {
+            $null = Get-ADDomain @ADContext -ErrorAction Stop
+            Add-ADPreflightCheck -Checks $checks -Name 'Domain connectivity' -Status 'Passed' -Details "Domain root resolved to '$DomainDN' ($NetBIOSName)."
+        }
+        catch {
+            Add-ADPreflightCheck -Checks $checks -Name 'Domain connectivity' -Status 'Failed' -Details $_.Exception.Message
+        }
+
+        if ($State.AdministratorsOnly) {
+            Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Passed' -Details 'Not required for an administrators-only run.'
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($State.NamesPath) -and -not (Test-Path -LiteralPath $State.NamesPath -PathType Leaf)) {
+            Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Failed' -Details "Names file not found: $($State.NamesPath)"
+        }
+        else {
+            Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Passed' -Details "Names file resolved to '$($State.NamesPath)'."
+        }
+
+        foreach ($department in $Departments) {
+            $departmentName = $department.Trim()
+            Add-ADPreflightCheck -Checks $checks -Name "Department name: $departmentName" -Status 'Passed' -Details "Validated department '$departmentName'."
+        }
+
+        if ($State.CreateDepartmentAdministrators -and -not [string]::IsNullOrWhiteSpace($State.AdministratorUsername) -and
+            $Departments.Count -gt 1 -and -not $State.AdministratorUsername.Contains('{0}')) {
+            Add-ADPreflightCheck -Checks $checks -Name 'Administrator username template' -Status 'Failed' -Details "When creating department administrators for multiple departments, -AdministratorUsername must include {0}."
+        }
+        else {
+            Add-ADPreflightCheck -Checks $checks -Name 'Administrator username template' -Status 'Passed' -Details 'Administrator naming pattern is valid for the requested department layout.'
+        }
+    }
+
+    $companyExists = $false
+    $companyOUs = @()
+    if (-not (Get-Command Get-ADOrganizationalUnit -ErrorAction SilentlyContinue)) {
+        Write-ADAutoXConsole -Message '[Offline/Preview] Active Directory module is unavailable. Simulating OU preflight checks.' -Level Warning
+    }
+    else {
+        $companyFilterValue = ConvertTo-LdapFilterValue -Value $CompanyOuName
+        $companyOUs = @(Get-ADOrganizationalUnit @ADContext -LDAPFilter "(ou=$companyFilterValue)" -SearchBase $DomainDN -SearchScope OneLevel -ErrorAction Stop)
+        if ($companyOUs.Count -gt 1) {
+            throw "More than one OU named '$CompanyOuName' was found below '$DomainDN'. Use a unique OU name."
+        }
+        $companyExists = $companyOUs.Count -eq 1
+    }
     $checks.Add([pscustomobject]@{
         Name = 'Company OU'
         Status = if ($companyExists) { 'Passed' } else { 'NeedsAttention' }
-        Details = if ($companyExists) { "Root OU '$CompanyOuName' exists." } else { "Root OU '$CompanyOuName' will be created." }
+        Details = if ($isCanonicalProvisioning) {
+            "Company OU '$CompanyOuName' already exists: $companyExists."
+        }
+        elseif ($companyExists) {
+            "Root OU '$CompanyOuName' exists."
+        }
+        else {
+            "Root OU '$CompanyOuName' will be created during provisioning."
+        }
     })
 
     $staffExists = $false
+    $staffOUs = @()
     if ($companyExists) {
         $staffFilterValue = ConvertTo-LdapFilterValue -Value $StaffOuName
-        $staffOUs = @(Get-ADOrganizationalUnit -LDAPFilter "(ou=$staffFilterValue)" -SearchBase $companyOUs[0].DistinguishedName -SearchScope OneLevel -ErrorAction Stop)
+        $staffOUs = @(Get-ADOrganizationalUnit @ADContext -LDAPFilter "(ou=$staffFilterValue)" -SearchBase $companyOUs[0].DistinguishedName -SearchScope OneLevel -ErrorAction Stop)
+        if ($staffOUs.Count -gt 1) {
+            throw "More than one OU named '$StaffOuName' was found below '$($companyOUs[0].DistinguishedName)'."
+        }
         $staffExists = $staffOUs.Count -eq 1
     }
+    $staffDn = if ($staffExists) { [string]$staffOUs[0].DistinguishedName } else { '' }
+    $staffCheckName = if ($isCanonicalProvisioning) { 'Staff Names OU' } else { 'Staff OU' }
     $checks.Add([pscustomobject]@{
-        Name = 'Staff OU'
+        Name = $staffCheckName
         Status = if ($staffExists) { 'Passed' } else { 'NeedsAttention' }
-        Details = if ($staffExists) { "Staff OU '$StaffOuName' exists." } else { "Staff OU '$StaffOuName' will be created." }
+        Details = if ($isCanonicalProvisioning) {
+            if ($staffExists) { "'$StaffOuName' already exists at '$staffDn'." } else { "'$StaffOuName' was not found and will be created during Phase 2." }
+        }
+        elseif ($staffExists) {
+            "Staff OU '$StaffOuName' exists."
+        }
+        else {
+            "Staff OU '$StaffOuName' will be created during provisioning."
+        }
     })
-    foreach ($department in $Departments) {
-        $checks.Add([pscustomobject]@{ Name = "Department Structure: $department"; Status = 'Passed'; Details = "Validated target scope for $department." })
+
+    if ($isCanonicalProvisioning) {
+        foreach ($department in $Departments) {
+            $departmentDn = ''
+            if ($staffDn) {
+                $departmentFilter = ConvertTo-LdapFilterValue -Value $department
+                $departmentOUs = @(Get-ADOrganizationalUnit @ADContext -LDAPFilter "(ou=$departmentFilter)" `
+                    -SearchBase $staffDn -SearchScope OneLevel -ErrorAction Stop)
+                if ($departmentOUs.Count -gt 1) {
+                    throw "More than one OU named '$department' was found below '$staffDn'."
+                }
+                if ($departmentOUs.Count -eq 1) { $departmentDn = [string]$departmentOUs[0].DistinguishedName }
+            }
+
+            $departmentExists = -not [string]::IsNullOrWhiteSpace($departmentDn)
+            Add-ADPreflightCheck -Checks $checks -Name "Department OU: $department" `
+                -Status $(if ($departmentExists) { 'Passed' } else { 'NeedsAttention' }) `
+                -Details $(if ($departmentExists) { "Department OU '$department' already exists at '$departmentDn'." } else { "Department OU '$department' is not present yet and will be created during Phase 2." })
+
+            if (-not $State.CreateDepartmentAdministrators) { continue }
+
+            $departmentUsersDn = ''
+            if (-not $State.AdministratorsOnly -and $departmentDn) {
+                $usersOUs = @(Get-ADOrganizationalUnit @ADContext -LDAPFilter '(ou=Users)' `
+                    -SearchBase $departmentDn -SearchScope OneLevel -ErrorAction Stop)
+                if ($usersOUs.Count -gt 1) {
+                    throw "More than one Users OU was found below '$departmentDn'."
+                }
+                if ($usersOUs.Count -eq 1) { $departmentUsersDn = [string]$usersOUs[0].DistinguishedName }
+            }
+            $checkUsersOu = -not $State.AdministratorsOnly -and
+                -not ($State.TreatZeroAccountCountAsNone -and [int]$State.AccountCount -eq 0)
+            if ($checkUsersOu) {
+                $usersOuExists = -not [string]::IsNullOrWhiteSpace($departmentUsersDn)
+                Add-ADPreflightCheck -Checks $checks -Name "Department Users OU: $department" `
+                    -Status $(if ($usersOuExists) { 'Passed' } else { 'NeedsAttention' }) `
+                    -Details $(if ($usersOuExists) { "Department Users OU for '$department' already exists at '$departmentUsersDn'." } else { "Department Users OU for '$department' is not present yet and will be created during Phase 2." })
+            }
+
+            $adminOuDn = ''
+            if ($departmentDn) {
+                $adminOUs = @(Get-ADOrganizationalUnit @ADContext -LDAPFilter '(ou=Administrators)' `
+                    -SearchBase $departmentDn -SearchScope OneLevel -ErrorAction Stop)
+                if ($adminOUs.Count -gt 1) {
+                    throw "More than one Administrators OU was found below '$departmentDn'."
+                }
+                if ($adminOUs.Count -eq 1) { $adminOuDn = [string]$adminOUs[0].DistinguishedName }
+            }
+            $adminOuExists = -not [string]::IsNullOrWhiteSpace($adminOuDn)
+            Add-ADPreflightCheck -Checks $checks -Name "Department Administrators OU: $department" `
+                -Status $(if ($adminOuExists) { 'Passed' } else { 'NeedsAttention' }) `
+                -Details $(if ($adminOuExists) { "Department Administrators OU for '$department' already exists at '$adminOuDn'." } else { "Department Administrators OU for '$department' is not present yet and will be created during Phase 2." })
+
+            $adminUsernameTemplate = if ($State.AdministratorUsername) {
+                if ($State.AdministratorUsername.Contains('{0}')) { $State.AdministratorUsername -f $department } else { $State.AdministratorUsername }
+            }
+            else {
+                "$($department.ToLowerInvariant()).admin"
+            }
+            $resolvedAdminSamAccountName = Get-UniqueSamAccountName -BaseName $adminUsernameTemplate `
+                -UsedNames ([System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase))
+            Add-ADPreflightCheck -Checks $checks -Name "Administrator SAM name: $department" -Status 'Passed' `
+                -Details "Resolved administrator SAM name '$resolvedAdminSamAccountName' for department '$department'."
+
+            if ($departmentUsersDn -and $adminOuDn) {
+                $adminGroupName = "${department}-Administrators"
+                $adminGroupFilter = ConvertTo-LdapFilterValue -Value $adminGroupName
+                $adminGroups = @(Get-ADGroup @ADContext -LDAPFilter "(cn=$adminGroupFilter)" `
+                    -SearchBase $adminOuDn -SearchScope OneLevel -Properties SID,GroupScope,GroupCategory -ErrorAction Stop)
+                if ($adminGroups.Count -gt 1) {
+                    throw "More than one administrator group named '$adminGroupName' was found below '$adminOuDn'."
+                }
+                if ($adminGroups.Count -eq 0) {
+                    $delegationStatus = 'NeedsAttention'
+                    $delegationDetails = "Administrator group '$adminGroupName' will be created during provisioning; delegation will be scoped to that newly created group's SID."
+                }
+                else {
+                    $groupSid = Get-ADValidatedSecurityGroupSid -Group $adminGroups[0] `
+                        -ExpectedName $adminGroupName -ExpectedParentDistinguishedName $adminOuDn
+                    $acl = Get-Acl -LiteralPath "AD:\$departmentUsersDn" -ErrorAction Stop
+                    $delegationPresent = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
+                    $delegationStatus = if ($delegationPresent) { 'Passed' } else { 'Failed' }
+                    $delegationDetails = if ($delegationPresent) {
+                        "Delegation for '$adminGroupName' on '$departmentUsersDn' is already present for the validated group SID."
+                    }
+                    else {
+                        "Pre-existing administrator group '$adminGroupName' has no matching SID-scoped delegation on '$departmentUsersDn'; automatic delegation is refused."
+                    }
+                }
+                Add-ADPreflightCheck -Checks $checks -Name "Delegation state: $department" `
+                    -Status $delegationStatus -Details $delegationDetails
+            }
+        }
     }
+    else {
+        foreach ($department in $Departments) {
+            $checks.Add([pscustomobject]@{ Name = "Department Structure: $department"; Status = 'Passed'; Details = "Validated target scope for $department." })
+        }
+    }
+
     $summary = [pscustomobject]@{
+        Passed = @($checks | Where-Object Status -eq 'Failed').Count -eq 0
         PassedCount = @($checks | Where-Object Status -eq 'Passed').Count
-        NeedsAttentionCount = 0
+        NeedsAttentionCount = @($checks | Where-Object Status -eq 'NeedsAttention').Count
+        FailedCount = @($checks | Where-Object Status -eq 'Failed').Count
+        HasIssues = @($checks | Where-Object Status -ne 'Passed').Count -gt 0
         Checks = $checks.ToArray()
     }
-    $summary.NeedsAttentionCount = @($checks | Where-Object Status -eq 'NeedsAttention').Count
     Write-ADAutoXConsole -Message "Preflight completed: $($summary.PassedCount) passed, $($summary.NeedsAttentionCount) pending creation." -Level Info
     $summary
 }
@@ -628,7 +1100,7 @@ $publicFunctions = @(
     'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser',
     'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation',
     'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback',
-    'Invoke-ADAutoXUserLifecycle', 'Enable-ADAutoXUser', 'Disable-ADAutoXUser',
+    'Invoke-ADAutoXUserLifecycle', 'Invoke-ADAutoXUserAction', 'Enable-ADAutoXUser', 'Disable-ADAutoXUser',
     'Unlock-ADAutoXUser', 'Reset-ADAutoXUserPassword', 'Move-ADAutoXUser',
     'Stop-ADAutoXUser', 'Remove-ADAutoXUser', 'Set-ADAutoXUserGroupMembership',
     'Disable-ADAutoXInactiveUsers', 'Get-ADAutoXLockedOutUsers', 'Update-ADAutoXUserDepartments',
@@ -642,4 +1114,4 @@ $publicFunctions = @(
     'Add-ADAutoXLedgerEntry', 'Invoke-ADAutoXLedgerRollback', 'Invoke-ADAutoXPreflight'
 )
 
-Export-ModuleMember -Function $publicFunctions -Alias Terminate-ADAutoXUser
+Export-ModuleMember -Function $publicFunctions -Alias Terminate-ADAutoXUser, Manage-ADAutoXUser

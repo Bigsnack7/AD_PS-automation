@@ -4,9 +4,7 @@
 ![Active Directory](https://img.shields.io/badge/Active%20Directory-Automation-2DDE98?logo=microsoft&logoColor=white)
 ![Scope](https://img.shields.io/badge/Scope-Lab%20%2F%20Test-FF6B6B)
 
-**Safety-first PowerShell automation for Active Directory: provisioning, user lifecycle administration, and audit reporting.**
-
-AD_PS-automation builds a department-based OU structure with scoped delegation, bulk-provisions test users, and runs lifecycle operations (enable, disable, move, terminate, delete, unlock, password reset, group changes). Every change can be previewed with `-WhatIf`, destructive actions need an explicit opt-in, results are re-queried from AD to confirm they took effect, and instrumented actions are written to a structured JSONL audit log. The `ADAutoX` module exposes the same functionality as a reusable PowerShell API.
+AD_PS-automation is a PowerShell toolkit for safely provisioning department-based Active Directory OU structures, groups, users, and scoped delegation; performing supported user lifecycle actions; and producing security, audit, and user reports. A shared `ADAutoX` module centralizes the public API, provisioning preflight, lifecycle protections, verification, audit records, and rollback ledger, while command scripts provide canonical and compatibility entry points.
 
 > **Scope:** built for lab, test, and controlled administrative use. Anything beyond a lab should go through your organization's change control and security review.
 
@@ -14,15 +12,15 @@ AD_PS-automation builds a department-based OU structure with scoped delegation, 
 ![Provisioning run](docs/demo.gif)
 -->
 
-[Highlights](#highlights) · [Architecture](#architecture) · [Quick start](#quick-start) · [Provisioning](#how-a-provisioning-run-works) · [Lifecycle](#user-lifecycle) · [Safety](#safety-model) · [Audit](#audit-logging) · [Testing](#testing) · [Reference](#reference)
+[Highlights](#highlights) · [Architecture](#architecture) · [Quick start](#quick-start) · [Provisioning](#how-a-provisioning-run-works) · [Lifecycle](#user-lifecycle) · [Safety features](#safety-features) · [Audit](#audit-logging) · [Testing](#testing) · [Reference](#reference)
 
 ## Highlights
 
 | Principle | What it means in practice |
 | --- | --- |
-| **Previewable** | Mutating commands use PowerShell's native `-WhatIf` / `-Confirm` (`ShouldProcess`). There is no custom dry-run flag to learn. |
-| **Gated** | Destructive operations need an explicit switch such as `-AllowDestructiveOperation`, and live cleanup also needs the exact target DN. |
-| **Verified** | Scripts re-query AD after a change (group membership, enabled state, password state) instead of trusting a cmdlet that returned without error. |
+| **Previewable** | Commands that declare `SupportsShouldProcess` use PowerShell's native `-WhatIf` / `-Confirm`; check command help to confirm support. |
+| **Gated** | Applicable high-impact operations need an explicit switch such as `-AllowDestructiveOperation`, and live cleanup also needs the exact target DN. |
+| **Verified** | Operations with implemented post-change checks re-query AD for outcomes such as group membership, enabled state, and password state. |
 | **Auditable** | Provisioning and lifecycle commands write JSONL records for the actions they instrument, including failures and verification outcomes. |
 | **Rerun-safe** | Existing matching identities are detected before creation, so repeating a run does not create duplicate or colliding accounts. |
 | **Least privilege** | Department administrators get narrowly scoped create/delete and read rights; sensitive attribute writes are reserved for separately reviewed delegation. |
@@ -33,24 +31,40 @@ AD_PS-automation builds a department-based OU structure with scoped delegation, 
 ```mermaid
 flowchart TD
     subgraph Entry["Entry points"]
-        Console["ControlConsole.ps1<br/>interactive menu"]
-        Cmdlets["Cmdlets/*.ps1<br/>provision, lifecycle, reports"]
+        Console["ControlConsole.ps1"]
+        Scripts["Cmdlets entry scripts"]
+        Wrappers["Compatibility wrappers"]
     end
-    subgraph Module["Modules/ADAutoX.psd1"]
-        Prov["Provisioning<br/>OUs, groups, users, delegation"]
-        Life["Lifecycle<br/>enable, disable, move, terminate"]
-        Safe["Shared safety layer<br/>preflight, verification, ShouldProcess gates"]
+    subgraph API["Modules/ADAutoX.psd1 - ADAutoX API"]
+        Core["ADAutoX.psm1<br/>shared APIs and ledger"]
+        Lifecycle["ADAutoX.Lifecycle.psm1<br/>lifecycle API and guard"]
+        Operations["AD-Operations.psm1<br/>AD context, helpers, audit"]
     end
-    Console --> Module
-    Cmdlets --> Module
-    Prov --> AD[("Active Directory")]
-    Life --> AD
-    Safe -.-> Prov
-    Safe -.-> Life
-    Module --> Audit["AD-Operations.jsonl<br/>audit log"]
-    Module --> Report["CSV reports"]
-    Module --> Ledger["Rollback ledger<br/>session only"]
+    Preflight["Invoke-ADAutoXPreflight<br/>provisioning checks"]
+    Provision["Provisioning<br/>mark42.ps1 / module"]
+    LifecycleActions["Lifecycle actions"]
+    Verify["Post-change verification<br/>where implemented"]
+    Records["JSONL audit, reports<br/>and in-memory rollback ledger"]
+    AD[("Active Directory")]
+
+    Console --> Scripts
+    Wrappers --> Scripts
+    Scripts --> Core
+    Scripts --> Lifecycle
+    Core --> Preflight
+    Preflight --> Provision
+    Lifecycle --> LifecycleActions
+    Provision --> AD
+    LifecycleActions --> AD
+    AD --> Verify
+    Provision --> Records
+    LifecycleActions --> Records
+    Verify --> Records
+    Operations -.-> Core
+    Operations -.-> Lifecycle
 ```
+
+`Invoke-ADAutoXPreflight` is the one provisioning-preflight implementation; the older `Test-ADProvisioningPreflight` entry delegates to it. Lifecycle actions use their own target checks and protected-account guard, not the provisioning preflight.
 
 ```text
 AD_PS-automation/
@@ -61,7 +75,34 @@ AD_PS-automation/
 └── README.md
 ```
 
-Run command scripts from the repository root using their `.\Cmdlets\...` paths. `mark42.ps1` is the canonical bulk provisioner; `ActiveDirectory-Provisioner.ps1` and `Generate-ADUsers.ps1` keep their older command-line interfaces as thin wrappers, so provisioning fixes live in one implementation.
+Run command scripts from the repository root using their `.\Cmdlets\...` paths.
+
+### Compatibility wrappers
+
+These legacy scripts preserve older command names or parameter interfaces and forward work to the listed canonical script or module function. They are adapters, not separate implementations of the forwarded operation. `ActiveDirectory-Provisioner.ps1` and `Generate-ADUsers.ps1` retain legacy provisioning defaults, so review their parameter descriptions before use.
+
+| Legacy script | Forwards to |
+| --- | --- |
+| [`ActiveDirectory-Provisioner.ps1`](./Cmdlets/ActiveDirectory-Provisioner.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1) |
+| [`Generate-ADUsers.ps1`](./Cmdlets/Generate-ADUsers.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1), with legacy defaults |
+| [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | `Invoke-ADAutoXUserAction` |
+| [`Remove-Test-Users.ps1`](./Cmdlets/Remove-Test-Users.ps1) | [`2_RESET_TEST_USERS.ps1`](./Cmdlets/2_RESET_TEST_USERS.ps1) |
+| [`Reset-ADAutoXEnvironment.ps1`](./Cmdlets/Reset-ADAutoXEnvironment.ps1) | `Invoke-ADAutoXLedgerRollback` with `-RollbackLedger`; otherwise [`Remove-Test-Users.ps1`](./Cmdlets/Remove-Test-Users.ps1) |
+| [`Script_AD_Audit_Report.ps1`](./Cmdlets/Script_AD_Audit_Report.ps1) | `Get-ADAutoXAuditReport` |
+| [`Script_AD_Security_Report.ps1`](./Cmdlets/Script_AD_Security_Report.ps1) | `Get-ADAutoXSecurityScan` |
+| [`Script_Add_User_to_Group.ps1`](./Cmdlets/Script_Add_User_to_Group.ps1) | `Set-ADAutoXUserGroupMembership` (add action) |
+| [`Script_Delete_User.ps1`](./Cmdlets/Script_Delete_User.ps1) | `Remove-ADAutoXUser` |
+| [`Script_Disable_Inactive_Users.ps1`](./Cmdlets/Script_Disable_Inactive_Users.ps1) | `Disable-ADAutoXUser` when `-Identity` is supplied; otherwise `Disable-ADAutoXInactiveUsers` |
+| [`Script_Disable_User.ps1`](./Cmdlets/Script_Disable_User.ps1) | `Disable-ADAutoXUser` |
+| [`Script_Enable_User.ps1`](./Cmdlets/Script_Enable_User.ps1) | `Enable-ADAutoXUser` |
+| [`Script_Find_Locked-Out_Users.ps1`](./Cmdlets/Script_Find_Locked-Out_Users.ps1) | `Get-ADAutoXLockedOutUsers` |
+| [`Script_Move_User.ps1`](./Cmdlets/Script_Move_User.ps1) | `Move-ADAutoXUser` |
+| [`Script_Remove_User_from_Group.ps1`](./Cmdlets/Script_Remove_User_from_Group.ps1) | `Set-ADAutoXUserGroupMembership` (remove action) |
+| [`Script_Reset_User_Passwords.ps1`](./Cmdlets/Script_Reset_User_Passwords.ps1) | `Reset-ADAutoXUserPassword` |
+| [`Script_Terminate_User.ps1`](./Cmdlets/Script_Terminate_User.ps1) | `Stop-ADAutoXUser` |
+| [`Script_Unlock_User_Account.ps1`](./Cmdlets/Script_Unlock_User_Account.ps1) | `Unlock-ADAutoXUser` |
+
+Use the `ADAutoX` module or canonical `Cmdlets` commands for new automation, and check command help because parameters and defaults can differ across wrappers.
 
 ## Quick start
 
@@ -80,23 +121,23 @@ Run command scripts from the repository root using their `.\Cmdlets\...` paths. 
 Import-Module ActiveDirectory
 Get-ADDomain
 
-# 2. Preview (no changes; may still run read-only AD queries)
+# 2. Preview guarded changes; read-only AD queries and preview records may still occur
 .\Cmdlets\mark42.ps1 -AccountCount 5 -WhatIf
 
-# 3. Create test users
-.\Cmdlets\mark42.ps1 -AccountCount 5
+# Preview an individual lifecycle action
+.\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -WhatIf
 
-# 4. Snapshot what was created
-.\Cmdlets\Export-Test-Users.ps1 -OrganizationalUnitName 'Company'
+# Preview cleanup before deciding whether to apply it
+.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
 
-# 5. Review the audit trail
+# Read-only audit review
 .\Cmdlets\Script_AD_Audit_Report.ps1
 
-# 6. Clean up (preview first, then apply with the exact DN shown by the preview)
+# Preview cleanup; do not apply until the target DN and plan have been reviewed
 .\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
-.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -AllowDestructiveOperation `
-    -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com'
 ```
+
+For any approved live change, rerun the reviewed command without `-WhatIf` and supply any required destructive-operation switch and exact target confirmation. A preview is not an offline simulation: read-only Active Directory queries can still run.
 
 In multi-DC environments, pass `-Server <dc>` to choose the writable DC. If you omit it, one writable DC is resolved at startup and reused for the whole run, including verification and delegation changes.
 
@@ -149,10 +190,10 @@ Use `-Departments` and `-OrganizationalUnitName` to change the layout, and `-Cre
 
 ```powershell
 # Custom departments
-.\Cmdlets\mark42.ps1 -AccountCount 20 -Departments 'Engineering','Support','Operations'
+.\Cmdlets\mark42.ps1 -AccountCount 20 -Departments 'Engineering','Support','Operations' -WhatIf
 
 # Custom names file and OU name
-.\Cmdlets\mark42.ps1 -NamesPath '.\custom-names.txt' -OrganizationalUnitName '_LAB-USERS'
+.\Cmdlets\mark42.ps1 -NamesPath '.\custom-names.txt' -OrganizationalUnitName '_LAB-USERS' -WhatIf
 
 # Administrators only, with generated names like deptadmin-IT
 .\Cmdlets\mark42.ps1 -AdministratorsOnly -AdministratorUsername 'deptadmin-{0}' -WhatIf
@@ -163,10 +204,10 @@ Use `-Departments` and `-OrganizationalUnitName` to change the layout, and `-Cre
 
 # One shared password, prompted securely
 $securePassword = Read-Host 'Shared lab password' -AsSecureString
-.\Cmdlets\mark42.ps1 -AccountCount 5 -Password $securePassword
+.\Cmdlets\mark42.ps1 -AccountCount 5 -Password $securePassword -WhatIf
 
-# Opt in to an encrypted credential export
-.\Cmdlets\mark42.ps1 -AccountCount 5 -ExportPasswords -PasswordFile '.\user-passwords.clixml'
+# Preview provisioning with an opt-in DPAPI-protected credential export
+.\Cmdlets\mark42.ps1 -AccountCount 5 -ExportPasswords -PasswordFile '.\user-passwords.clixml' -WhatIf
 ```
 
 ## User lifecycle
@@ -174,9 +215,8 @@ $securePassword = Read-Host 'Shared lab password' -AsSecureString
 Lifecycle commands resolve an identity by SAM account name or distinguished name, verify the outcome where supported, and restore shared AD context in `finally`. Disable, terminate, delete, and group-removal actions require `-AllowDestructiveOperation` on top of preview and confirmation.
 
 ```powershell
-# Preview, then apply an approved disable
+# Preview an individual lifecycle action
 .\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -WhatIf
-.\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -AllowDestructiveOperation
 
 # Preview a move and a termination
 .\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Move `
@@ -186,7 +226,7 @@ Lifecycle commands resolve an identity by SAM account name or distinguished name
 
 # Find and clear locked accounts, scan for risky accounts
 .\Cmdlets\Script_Find_Locked-Out_Users.ps1 -CsvPath '.\reports\locked.csv'
-.\Cmdlets\Script_Unlock_User_Account.ps1 -Identity 'jdoe'
+.\Cmdlets\Script_Unlock_User_Account.ps1 -Identity 'jdoe' -WhatIf
 .\Cmdlets\Get-ADAutoXSecurityScan.ps1 -InactiveDays 90
 ```
 
@@ -203,41 +243,46 @@ Move-ADAutoXUser -Identity 'jdoe' -TargetPath 'OU=Users,OU=IT,OU=Staff,OU=Compan
 Disable-ADAutoXUser -Identity 'jdoe' -AllowDestructiveOperation -WhatIf
 ```
 
-The `Cmdlets\Script_*.ps1` commands delegate to these module functions. `Terminate-ADAutoXUser` remains available as a compatibility alias for the approved-verb `Stop-ADAutoXUser`. Module imports resolve relative to the importing script, so the repository can be cloned anywhere.
+The [compatibility wrapper list](#compatibility-wrappers) maps each legacy script to its module function or canonical script. `Terminate-ADAutoXUser` remains available as a compatibility alias for `Stop-ADAutoXUser`, and `Manage-ADAutoXUser` remains an alias for `Invoke-ADAutoXUserAction`. Module imports resolve relative to the importing script, so the repository can be cloned anywhere.
 
 ### Rollback ledger
 
-Successful reversible lifecycle changes are recorded in a session-scoped ledger: enablement state, moves, direct group membership, termination descriptions, and department/company updates. Rollback checks that each object still has the state produced by the recorded change before restoring it, so it never overwrites later changes. Entries are applied in reverse order and removed only after verification.
+Successful reversible lifecycle changes are recorded in a session-scoped ledger: enablement state, moves, direct group membership, termination descriptions, and department/company updates. Rollback checks that each object still has the state produced by the recorded change before restoring it, so it avoids overwriting later changes. Lifecycle entries are processed newest-first; created resources are removed in dependency order (users, delegation, groups, then deepest OUs). Ledger entries are removed after successful rollback processing.
 
 ```powershell
-# Review pending entries, then preview and apply the reversal in the same session
+# Review pending entries, then preview the reversal in the same session
 Get-ADAutoXLedger
 .\Cmdlets\Reset-ADAutoXEnvironment.ps1 -RollbackLedger `
     -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com' -WhatIf
-.\Cmdlets\Reset-ADAutoXEnvironment.ps1 -RollbackLedger `
-    -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com' -AllowDestructiveOperation
 ```
 
-The ledger lives only in the current PowerShell session. Password resets, unlocks, and deletions cannot be restored by it, and it never deletes the environment OU.
+`Add-ADAutoXLedgerEntry` is the shared writer for resource and lifecycle entries. `Invoke-ADAutoXLedgerRollback` handles eligible OU, group, user, delegation, and lifecycle undo entries. The ledger lives only in the current PowerShell session. Password resets, unlocks, and deletions cannot be restored by it, and it never deletes the environment OU.
 
-## Safety model
+## Safety features
 
 **Before a change**
 
-- Preview with `-WhatIf`. Read-only AD queries and preflight checks may still run, so `-WhatIf` is not an offline simulation.
+- **Single preflight:** `Invoke-ADAutoXPreflight` contains the provisioning preflight logic. The compatibility function `Test-ADProvisioningPreflight` delegates to it. It performs non-mutating dependency, domain, input, OU, group, and delegation checks applicable to the requested provisioning run. Lifecycle commands resolve and validate their targets, but do not run this provisioning preflight.
+- **Protected-account guard:** applicable lifecycle actions refuse accounts with `AdminCount = 1`, membership in the configured protected groups, `IsCriticalSystemObject = $true`, built-in SAM names (`Administrator`, `Guest`, `krbtgt`), or the account running the script. Accidental-deletion protection is checked for termination and deletion. An explicit `-AllowProtectedAccount` bypass logs a warning and audit entry; use it only with specific approval. The check is not a substitute for reviewing the target and change.
+- **`-WhatIf` / `-Confirm`:** commands that declare `SupportsShouldProcess` can preview or confirm their guarded changes. Read-only AD queries and preflight checks may still run during `-WhatIf`; it is not an offline simulation. Check command help rather than assuming every script supports these common parameters.
 - Cleanup commands refuse protected built-in targets (such as `Domain Controllers`), check the exact target DN before live deletion, and process descendants before parents.
 - Bulk inactivity scans over the whole domain require `-AllowDomainWide`.
 
 **Rollback**
 
+- **Unified rollback ledger:** `Add-ADAutoXLedgerEntry` is the shared writer for run-created OUs, groups, users, exact delegation entries, and supported reversible lifecycle changes. `Invoke-ADAutoXLedgerRollback` processes eligible entries, checks current state before undoing, and processes lifecycle undo entries before created resources. It does not restore password resets, unlocks, or deletions, and the ledger does not survive the PowerShell session.
 - `-RollbackCreatedAccountsOnFailure` (aliases `-RollbackOnFailure`, `-RollbackAccountsOnFailure`) removes only accounts created by the current run.
 - `-RollbackCreatedResourcesOnFailure`, used by the ADAutoX provisioning adapter, also attempts to remove run-created groups, the exact delegation entries added by the run, and empty OUs carrying the provisioner marker. It never recursively deletes an OU, and pre-existing resources are kept.
 - Rollback is best-effort. Verify the directory and logs afterwards.
 
+**Audit**
+
+- **JSONL audit:** instrumented provisioning and lifecycle actions write structured JSON Lines records to `AD-Operations.jsonl` by default (or the supplied `-AuditLogPath`). Coverage is per command/action; do not assume every read or mutation is logged.
+
 **Credentials**
 
 - Passwords are generated randomly per account by default and are **not** stored unless you opt in.
-- `-ExportPasswords` writes a DPAPI-protected CLIXML file (Windows only, current user and machine), staged with a restrictive ACL and published only after staging succeeds. Existing files are not replaced without `-OverwritePasswordFile`. It is not a credential vault: restrict access and set a retention policy.
+- `-ExportPasswords` writes a DPAPI-protected CLIXML credential export on Windows. The staged file is ACL-restricted to the current Windows identity before publication; an existing destination is not replaced without `-OverwritePasswordFile`. This is not a credential vault: restrict access and set a retention policy.
 - `-IncludePasswordInReport` writes **plaintext** passwords to the CSV. Use it only for a specific, approved, short-lived need and delete the report promptly.
 - Keep plaintext credentials out of scripts, shell history, and shared folders.
 
@@ -263,12 +308,28 @@ Both report scripts share the same parser and filters; the legacy script keeps i
 
 ## Testing
 
-Offline checks need no AD connection and make no writes:
+Offline checks need no AD connection and do not make changes to Active Directory:
 
 ```powershell
 .\Tests\validate_repo.ps1      # parse every .ps1 and .psm1; exits nonzero on parser errors
-.\Tests\Run-OfflineTests.ps1   # regression suite; prints pass/fail totals
+.\Tests\Run-OfflineTests.ps1   # offline regression suite
 ```
+
+Run the regression suite from the repository root in Windows PowerShell 5.1 or PowerShell 7:
+
+```powershell
+.\Tests\Run-OfflineTests.ps1
+# Or explicitly:
+powershell.exe -NoProfile -File .\Tests\Run-OfflineTests.ps1
+```
+
+The offline suite exercises pure helpers and checks implementation wiring and safety contracts without connecting to AD or faking AD responses. The separate `Run-ADIntegrationTests.ps1` is opt-in and requires `-RunLive`; it is intended only for a disposable test domain. It has **not yet been verified in a live domain**. To attempt that integration test in an authorized test environment:
+
+```powershell
+.\Tests\Run-ADIntegrationTests.ps1 -RunLive -ExpectedDomainDnsRoot 'lab.example.test'
+```
+
+It securely prompts for a temporary password, verifies that the connected domain matches the supplied DNS root before changes, then provisions uniquely named test resources and rolls back only entries created by that test run. A writable DC and sufficient OU/group/delegation rights are required. The test stops if the current session ledger is not empty. It is not part of the offline suite.
 
 The suite covers LDAP/DN escaping, identity and error classification, inactivity cutoffs, termination notes, safe file publishing, credential-export guards, wrapper forwarding and rollback, audit filtering and correlation IDs, lifecycle ledger behavior, provisioning and name handling, password generation and patterns, context cleanup, group validation, and delegated ACL scope.
 
@@ -288,14 +349,13 @@ The suite covers LDAP/DN escaping, identity and error classification, inactivity
 Live cleanup requires `-ExpectedDistinguishedName` to match the target OU DN printed by the `-WhatIf` preview exactly. Replace the example domain with the DN from your preview.
 
 ```powershell
-.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf                # preview
-.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -AllowDestructiveOperation `
-    -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com'                            # accounts only
-.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -RemoveOrganizationalUnit `
-    -AllowDestructiveOperation -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com' # + OU hierarchy
-.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -DeleteEverything `
-    -AllowDestructiveOperation -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com' # everything
+.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
+.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -RemoveAllObjects `
+    -RemoveOrganizationalUnit -WhatIf
+.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -DeleteEverything -WhatIf
 ```
+
+These are previews only. After reviewing the output and confirming the exact DN, an approved live cleanup must be rerun with the required destructive-operation switch and `-ExpectedDistinguishedName`.
 
 ## Troubleshooting
 
@@ -342,7 +402,7 @@ The default live run requests 20 standard users, creates department administrato
 | `-ExportPasswords` | Off | Opt in to the DPAPI-protected CLIXML credential export. |
 | `-PasswordFile` | `user-passwords.clixml` when exporting | Export destination. Error if given without `-ExportPasswords`. |
 | `-OverwritePasswordFile` | Off | Allow replacing an existing export. |
-| `-IncludePasswordInReport` | Off | Add **plaintext** passwords to the CSV. See the [safety model](#safety-model). |
+| `-IncludePasswordInReport` | Off | Add **plaintext** passwords to the CSV. See [Safety features](#safety-features). |
 | `-WhatIf` / `-Confirm` / `-Verbose` | | Standard PowerShell preview, confirmation, and diagnostic output. |
 
 Two hidden compatibility parameters, `-TreatZeroAccountCountAsNone` and `-DisableDepartmentAdministratorsByDefault`, exist for the wrapper scripts and are not meant for direct use. Notably, `-AccountCount 0` on `mark42.ps1` means "all valid names", while the `Generate-ADUsers.ps1` wrapper keeps its older meaning of "no standard users" and makes administrator creation opt-in. `ActiveDirectory-Provisioner.ps1` requires an explicit `-PasswordFile` for credential export.

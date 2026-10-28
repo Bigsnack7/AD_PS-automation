@@ -24,7 +24,7 @@
         'New-CompanyOU', 'New-DepartmentOU', 'New-DepartmentGroups', 'New-DepartmentUser',
         'New-DepartmentAdministrator', 'Enable-VerifiedDepartmentAccount', 'Set-DepartmentDelegation',
         'Test-DepartmentProvisioning', 'Export-ProvisioningReport', 'Invoke-ProvisioningRollback',
-        'Invoke-ADAutoXUserLifecycle', 'Enable-ADAutoXUser', 'Disable-ADAutoXUser',
+        'Invoke-ADAutoXUserLifecycle', 'Invoke-ADAutoXUserAction', 'Enable-ADAutoXUser', 'Disable-ADAutoXUser',
         'Unlock-ADAutoXUser', 'Reset-ADAutoXUserPassword', 'Move-ADAutoXUser',
         'Stop-ADAutoXUser', 'Remove-ADAutoXUser', 'Set-ADAutoXUserGroupMembership',
         'Disable-ADAutoXInactiveUsers', 'Get-ADAutoXLockedOutUsers', 'Update-ADAutoXUserDepartments',
@@ -41,5 +41,5 @@
     )
     CmdletsToExport = @()
     VariablesToExport = @()
-    AliasesToExport = @('Terminate-ADAutoXUser')
+    AliasesToExport = @('Terminate-ADAutoXUser', 'Manage-ADAutoXUser')
 }

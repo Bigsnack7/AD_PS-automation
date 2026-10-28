@@ -17,6 +17,65 @@ function Add-ADAutoXLifecycleUndoEntry {
     Add-ADAutoXLedgerEntry -ObjectType Lifecycle -Action $Action -UndoData $UndoData
 }
 
+function Test-ADAutoXProtectedAccount {
+    param(
+        [Parameter(Mandatory)][psobject]$User,
+        [Parameter(Mandatory)][hashtable]$ADContext,
+        [Parameter(Mandatory)][ValidateSet('Disable', 'Terminate', 'Delete', 'ResetPassword', 'Move', 'AddToGroup', 'RemoveFromGroup')][string]$Action,
+        [ref]$Reason
+    )
+
+    $account = Get-ADUser @ADContext -Identity $User.DistinguishedName `
+        -Properties AdminCount,IsCriticalSystemObject,SID,SamAccountName -ErrorAction Stop
+    $reasons = [System.Collections.Generic.List[string]]::new()
+
+    if ([int]$account.AdminCount -eq 1) {
+        $reasons.Add('AdminCount is 1')
+    }
+
+    $protectedGroups = @(
+        'Domain Admins',
+        'Enterprise Admins',
+        'Schema Admins',
+        'Administrators',
+        'Account Operators',
+        'Backup Operators'
+    )
+    $accountGroups = @(Get-ADPrincipalGroupMembership @ADContext -Identity $account -ErrorAction Stop)
+    foreach ($group in $accountGroups) {
+        if ($group.Name -in $protectedGroups) {
+            $reasons.Add("member of protected group '$($group.Name)'")
+        }
+    }
+
+    if ($account.IsCriticalSystemObject) {
+        $reasons.Add('IsCriticalSystemObject is true')
+    }
+
+    if ($account.SamAccountName -in @('Administrator', 'Guest', 'krbtgt')) {
+        $reasons.Add("built-in account '$($account.SamAccountName)'")
+    }
+
+    $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($currentUserSid -and $account.SID -and
+        [string]$currentUserSid -eq [string]$account.SID) {
+        $reasons.Add('account is running this script')
+    }
+
+    if ($Action -in @('Terminate', 'Delete')) {
+        $protectedObject = Get-ADObject @ADContext -Identity $account.DistinguishedName `
+            -Properties ProtectedFromAccidentalDeletion -ErrorAction Stop
+        if ($protectedObject.ProtectedFromAccidentalDeletion) {
+            $reasons.Add('ProtectedFromAccidentalDeletion is true')
+        }
+    }
+
+    if ($Reason) {
+        $Reason.Value = $reasons -join '; '
+    }
+    return ($reasons.Count -gt 0)
+}
+
 function Invoke-ADAutoXUserLifecycle {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param(
@@ -34,6 +93,7 @@ function Invoke-ADAutoXUserLifecycle {
         [SecureString]$NewPassword,
         [switch]$MustChangeAtLogon,
         [switch]$AllowDestructiveOperation,
+        [switch]$AllowProtectedAccount,
         [string]$Server,
         [PSCredential]$Credential,
         [string]$AuditLogPath = ''
@@ -80,6 +140,28 @@ function Invoke-ADAutoXUserLifecycle {
         $adContext = Get-ADToolContextParameters
         $user = Resolve-ADIdentitySafe -Identity $Identity @adContext
         $target = $user.DistinguishedName
+
+        if ($Action -in @('Disable', 'Terminate', 'Delete', 'ResetPassword', 'Move', 'AddToGroup', 'RemoveFromGroup')) {
+            $protectionReason = ''
+            $isProtectedAccount = Test-ADAutoXProtectedAccount -User $user -ADContext $adContext `
+                -Action $Action -Reason ([ref]$protectionReason)
+            if ($isProtectedAccount) {
+                if (-not $AllowProtectedAccount) {
+                    $message = "Refusing action '$Action' on protected account '$($user.SamAccountName)': $protectionReason. Use -AllowProtectedAccount only when this change is explicitly approved."
+                    Write-ADAuditRecord -Path $AuditLogPath -Action $actionName -Target $target -TargetType $targetType `
+                        -Status 'Failed' -Message $message -Details "Blocked protected-account action. $protectionReason" `
+                        -Source 'ADAutoX' -CorrelationId $correlationId
+                    throw $message
+                }
+
+                $warning = "WARNING: -AllowProtectedAccount bypassed the protected-account guard for '$($user.SamAccountName)' during '$Action'. Reasons: $protectionReason"
+                Write-Warning $warning
+                Write-ADAuditRecord -Path $AuditLogPath -Action $actionName -Target $target -TargetType $targetType `
+                    -Status 'Started' -Message $warning -Details $warning `
+                    -Source 'ADAutoX' -CorrelationId $correlationId
+            }
+        }
+
         $targetOU = $null
         $groupObject = $null
         $currentParent = $null
@@ -304,6 +386,28 @@ function Invoke-ADAutoXLifecycleAction {
     Invoke-ADAutoXUserLifecycle @Arguments
 }
 
+function Invoke-ADAutoXUserAction {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Enable', 'Disable', 'Unlock', 'ResetPassword', 'Move', 'Terminate', 'Delete', 'AddToGroup', 'RemoveFromGroup')]
+        [string]$Action,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
+        [string]$TargetPath,
+        [string]$Group,
+        [string]$Reason = 'Terminated',
+        [SecureString]$NewPassword,
+        [switch]$MustChangeAtLogon,
+        [switch]$AllowDestructiveOperation,
+        [switch]$AllowProtectedAccount,
+        [string]$Server,
+        [PSCredential]$Credential,
+        [string]$AuditLogPath = ''
+    )
+
+    Invoke-ADAutoXUserLifecycle @PSBoundParameters
+}
+
 function Enable-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$Identity, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
@@ -313,8 +417,8 @@ function Enable-ADAutoXUser {
 
 function Disable-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
-    param([Parameter(Mandatory)][string]$Identity, [switch]$AllowDestructiveOperation, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
-    $arguments = @{ Action = 'Disable'; Identity = $Identity; AllowDestructiveOperation = $AllowDestructiveOperation; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
+    param([Parameter(Mandatory)][string]$Identity, [switch]$AllowDestructiveOperation, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
+    $arguments = @{ Action = 'Disable'; Identity = $Identity; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
     Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
@@ -327,11 +431,12 @@ function Unlock-ADAutoXUser {
 
 function Reset-ADAutoXUserPassword {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
-    param([Parameter(Mandatory)][string]$Identity, [SecureString]$NewPassword, [switch]$MustChangeAtLogon, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
+    param([Parameter(Mandatory)][string]$Identity, [SecureString]$NewPassword, [switch]$MustChangeAtLogon, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $parameters = @{
         Action = 'ResetPassword'
         Identity = $Identity
         MustChangeAtLogon = $MustChangeAtLogon
+        AllowProtectedAccount = $AllowProtectedAccount
         Server = $Server
         Credential = $Credential
         AuditLogPath = $AuditLogPath
@@ -342,22 +447,22 @@ function Reset-ADAutoXUserPassword {
 
 function Move-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
-    param([Parameter(Mandatory)][string]$Identity, [Parameter(Mandatory)][string]$TargetPath, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
-    $arguments = @{ Action = 'Move'; Identity = $Identity; TargetPath = $TargetPath; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
+    param([Parameter(Mandatory)][string]$Identity, [Parameter(Mandatory)][string]$TargetPath, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
+    $arguments = @{ Action = 'Move'; Identity = $Identity; TargetPath = $TargetPath; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
     Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Stop-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
-    param([Parameter(Mandatory)][string]$Identity, [string]$TargetPath, [ValidateNotNullOrEmpty()][string]$Reason = 'Terminated', [switch]$AllowDestructiveOperation, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
-    $arguments = @{ Action = 'Terminate'; Identity = $Identity; TargetPath = $TargetPath; Reason = $Reason; AllowDestructiveOperation = $AllowDestructiveOperation; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
+    param([Parameter(Mandatory)][string]$Identity, [string]$TargetPath, [ValidateNotNullOrEmpty()][string]$Reason = 'Terminated', [switch]$AllowDestructiveOperation, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
+    $arguments = @{ Action = 'Terminate'; Identity = $Identity; TargetPath = $TargetPath; Reason = $Reason; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
     Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Remove-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
-    param([Parameter(Mandatory)][string]$Identity, [switch]$AllowDestructiveOperation, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
-    $arguments = @{ Action = 'Delete'; Identity = $Identity; AllowDestructiveOperation = $AllowDestructiveOperation; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
+    param([Parameter(Mandatory)][string]$Identity, [switch]$AllowDestructiveOperation, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
+    $arguments = @{ Action = 'Delete'; Identity = $Identity; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
     Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
@@ -368,12 +473,13 @@ function Set-ADAutoXUserGroupMembership {
         [Parameter(Mandatory)][string]$Identity,
         [Parameter(Mandatory)][string]$Group,
         [switch]$AllowDestructiveOperation,
+        [switch]$AllowProtectedAccount,
         [string]$Server,
         [PSCredential]$Credential,
         [string]$AuditLogPath = ''
     )
     $action = if ($Operation -eq 'Add') { 'AddToGroup' } else { 'RemoveFromGroup' }
-    $arguments = @{ Action = $action; Identity = $Identity; Group = $Group; AllowDestructiveOperation = $AllowDestructiveOperation; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
+    $arguments = @{ Action = $action; Identity = $Identity; Group = $Group; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
     Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
@@ -385,6 +491,7 @@ function Disable-ADAutoXInactiveUsers {
         [switch]$AllowDomainWide,
         [switch]$IncludeNeverLoggedOn,
         [switch]$AllowDestructiveOperation,
+        [switch]$AllowProtectedAccount,
         [string]$CsvPath,
         [string]$Server,
         [PSCredential]$Credential,
@@ -420,9 +527,26 @@ function Disable-ADAutoXInactiveUsers {
             $lastLogon = $user.LastLogonDate
             $oldEnough = if ($lastLogon) { $lastLogon -lt $cutoff } elseif ($IncludeNeverLoggedOn) { $user.WhenCreated -lt $cutoff } else { $false }
             if (-not $oldEnough) { continue }
-            if ($user.adminCount -or $user.ServicePrincipalName) {
-                $results.Add([pscustomobject]@{ Identity = $user.SamAccountName; Status = 'Skipped'; Reason = 'Protected or service account.' })
+            if ($user.ServicePrincipalName) {
+                $results.Add([pscustomobject]@{ Identity = $user.SamAccountName; Status = 'Skipped'; Reason = 'Service account.' })
                 continue
+            }
+
+            $protectionReason = ''
+            if (Test-ADAutoXProtectedAccount -User $user -ADContext $adContext -Action Disable -Reason ([ref]$protectionReason)) {
+                if (-not $AllowProtectedAccount) {
+                    $message = "Refusing to disable protected account '$($user.SamAccountName)': $protectionReason. Use -AllowProtectedAccount only when this change is explicitly approved."
+                    Write-ADAuditRecord -Path $AuditLogPath -Action 'DisableUser' -Target $user.DistinguishedName `
+                        -TargetType 'User' -Status 'Failed' -Message $message -Details "Blocked protected-account action. $protectionReason" `
+                        -Source 'ADAutoX' -CorrelationId $correlationId
+                    throw $message
+                }
+
+                $warning = "WARNING: -AllowProtectedAccount bypassed the protected-account guard for '$($user.SamAccountName)' during inactive-account disable. Reasons: $protectionReason"
+                Write-Warning $warning
+                Write-ADAuditRecord -Path $AuditLogPath -Action 'DisableUser' -Target $user.DistinguishedName `
+                    -TargetType 'User' -Status 'Started' -Message $warning -Details $warning `
+                    -Source 'ADAutoX' -CorrelationId $correlationId
             }
 
             if ($PSCmdlet.ShouldProcess($user.SamAccountName, 'Disable inactive Active Directory account')) {
@@ -643,6 +767,8 @@ function Get-ADAutoXAuditReport {
         [string]$Status,
         [string]$Actor,
         [string]$OutputPath,
+        [switch]$Summary,
+        [switch]$AsJson,
         [switch]$ErrorOnMalformedEntries
     )
 
@@ -703,6 +829,90 @@ function Get-ADAutoXAuditReport {
         $identityMatch -and $actionMatch -and $statusMatch -and $actorMatch
     })
 
+    if ($Summary) {
+        $normalizedRecords = @(
+            foreach ($record in $filtered) {
+                $normalized = [ordered]@{}
+                foreach ($fieldName in @(
+                    'Timestamp', 'Actor', 'Operator', 'Computer', 'Action', 'Target',
+                    'TargetType', 'Status', 'Message', 'Details', 'Source', 'CorrelationId'
+                )) {
+                    $property = $record.PSObject.Properties[$fieldName]
+                    $normalized[$fieldName] = if ($null -eq $property -or $null -eq $property.Value) {
+                        ''
+                    }
+                    else {
+                        [string]$property.Value
+                    }
+                }
+                [pscustomobject]$normalized
+            }
+        )
+        $summaryResult = [pscustomobject]@{
+            AuditLogPath = $resolvedPath
+            TotalRecords = $normalizedRecords.Count
+            UniqueActors = @($normalizedRecords | Select-Object -ExpandProperty Actor -Unique).Count
+            UniqueTargets = @($normalizedRecords | Select-Object -ExpandProperty Target -Unique).Count
+            FirstTimestamp = ''
+            LastTimestamp = ''
+            StatusCounts = @()
+            ActionCounts = @()
+            FailedRecords = @()
+        }
+
+        if ($normalizedRecords.Count -gt 0) {
+            $timestampValues = @($normalizedRecords |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_.Timestamp) } |
+                Select-Object -ExpandProperty Timestamp)
+            if ($timestampValues.Count -gt 0) {
+                $sortedTimestamps = @($timestampValues | Sort-Object)
+                $summaryResult.FirstTimestamp = $sortedTimestamps[0]
+                $summaryResult.LastTimestamp = $sortedTimestamps[-1]
+            }
+
+            $summaryResult.StatusCounts = @(
+                foreach ($statusName in @('Started', 'Succeeded', 'Failed', 'Skipped', 'Preview', 'CompletedWithErrors')) {
+                    $count = @($normalizedRecords | Where-Object { $_.Status -ieq $statusName }).Count
+                    if ($count -gt 0) {
+                        [pscustomobject]@{ Status = $statusName; Count = $count }
+                    }
+                }
+            )
+            $summaryResult.ActionCounts = @(
+                $normalizedRecords |
+                    Group-Object -Property Action |
+                    Sort-Object -Property Count -Descending |
+                    Select-Object @{Name = 'Action'; Expression = { $_.Name } }, Count
+            )
+            $summaryResult.FailedRecords = @(
+                $normalizedRecords |
+                    Where-Object { $_.Status -ieq 'Failed' } |
+                    Select-Object Timestamp, Actor, Action, Target, Message, Details
+            )
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+            $resolvedOutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+            if ([string]::IsNullOrWhiteSpace([System.IO.Path]::GetFileName($resolvedOutputPath))) {
+                throw "Output path '$OutputPath' must identify a file."
+            }
+            $outputDirectory = Split-Path -Parent $resolvedOutputPath
+            if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+                $null = New-Item -ItemType Directory -Path $outputDirectory -Force -ErrorAction Stop
+            }
+            if ($AsJson) {
+                $summaryResult | ConvertTo-Json -Depth 8 |
+                    Set-Content -LiteralPath $resolvedOutputPath -Encoding UTF8 -ErrorAction Stop
+            }
+            else {
+                $normalizedRecords |
+                    Select-Object Timestamp, Actor, Operator, Computer, Action, Target, TargetType, Status, Message, Details, Source, CorrelationId |
+                    Export-Csv -LiteralPath $resolvedOutputPath -NoTypeInformation -Force -Encoding UTF8 -ErrorAction Stop
+            }
+        }
+        return $summaryResult
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
         $resolvedOutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
         if ([string]::IsNullOrWhiteSpace([System.IO.Path]::GetFileName($resolvedOutputPath))) {
@@ -749,4 +959,5 @@ function Write-ADAutoXLogRecord {
 }
 
 Set-Alias -Name Terminate-ADAutoXUser -Value Stop-ADAutoXUser
-Export-ModuleMember -Function Invoke-ADAutoXUserLifecycle, Enable-ADAutoXUser, Disable-ADAutoXUser, Unlock-ADAutoXUser, Reset-ADAutoXUserPassword, Move-ADAutoXUser, Stop-ADAutoXUser, Remove-ADAutoXUser, Set-ADAutoXUserGroupMembership, Disable-ADAutoXInactiveUsers, Get-ADAutoXLockedOutUsers, Update-ADAutoXUserDepartments, Protect-ADAutoXFileAcl, Export-ADAutoXCredentials, Get-ADAutoXAuditReport, New-ADAutoXCorrelationId, Get-ADAutoXCorrelationId, Write-ADAutoXLogRecord -Alias Terminate-ADAutoXUser
+Set-Alias -Name Manage-ADAutoXUser -Value Invoke-ADAutoXUserAction
+Export-ModuleMember -Function Invoke-ADAutoXUserLifecycle, Invoke-ADAutoXUserAction, Enable-ADAutoXUser, Disable-ADAutoXUser, Unlock-ADAutoXUser, Reset-ADAutoXUserPassword, Move-ADAutoXUser, Stop-ADAutoXUser, Remove-ADAutoXUser, Set-ADAutoXUserGroupMembership, Disable-ADAutoXInactiveUsers, Get-ADAutoXLockedOutUsers, Update-ADAutoXUserDepartments, Protect-ADAutoXFileAcl, Export-ADAutoXCredentials, Get-ADAutoXAuditReport, New-ADAutoXCorrelationId, Get-ADAutoXCorrelationId, Write-ADAutoXLogRecord -Alias Terminate-ADAutoXUser, Manage-ADAutoXUser

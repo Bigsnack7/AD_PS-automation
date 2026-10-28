@@ -3,73 +3,51 @@
     Produces a summary report from the JSONL audit log created by the AD toolkit.
 
 .DESCRIPTION
-    Reads AD-Operations.jsonl (or a supplied audit log path) through the shared ADAutoX audit
-    reader, normalizes the records, applies optional filters, and prints a human-readable summary
-    to the console. When -OutputPath is supplied, it also exports the filtered records as a CSV
-    timeline.
-
+    Reads the shared ADAutoX audit log, applies optional filters, and prints a human-readable
+    summary. When -OutputPath is supplied, the filtered records are exported as JSON or CSV.
     This read-only report does not require Active Directory connectivity.
-
-.EXAMPLE
-    .\Cmdlets\Script_AD_Audit_Report.ps1
-
-.EXAMPLE
-    .\Cmdlets\Script_AD_Audit_Report.ps1 -AuditLogPath .\AD-Operations.jsonl -Identity jdoe -OutputPath .\jdoe-audit.csv
 #>
 [CmdletBinding()]
 param(
     [string]$AuditLogPath = '',
-
     [string]$Identity,
-
     [string]$Action,
-
     [ValidateSet('Started', 'Succeeded', 'Failed', 'Skipped', 'Preview', 'CompletedWithErrors')]
     [string]$Status,
-
     [string]$OutputPath,
-
     [switch]$AsJson
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-
-$scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
-
-function Get-JsonRecordValue {
-    param(
-        [Parameter(Mandatory)][psobject]$Record,
-        [Parameter(Mandatory)][string]$Name
-    )
-
-    $property = $Record.PSObject.Properties[$Name]
-    if ($null -eq $property -or $null -eq $property.Value) {
-        return ''
-    }
-    return [string]$property.Value
+$scriptDirectory = Split-Path -Parent $PSScriptRoot
+$resolvedAuditLogPath = if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
+    Join-Path $scriptDirectory 'AD-Operations.jsonl'
 }
+else {
+    $AuditLogPath
+}
+$resolvedAuditLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedAuditLogPath)
 
-function Get-ADAuditRecordObject {
-    param(
-        [Parameter(Mandatory)][psobject]$Record
-    )
-
-    [pscustomobject]@{
-        Timestamp     = Get-JsonRecordValue -Record $Record -Name 'Timestamp'
-        Actor         = Get-JsonRecordValue -Record $Record -Name 'Actor'
-        Operator      = Get-JsonRecordValue -Record $Record -Name 'Operator'
-        Computer      = Get-JsonRecordValue -Record $Record -Name 'Computer'
-        Action        = Get-JsonRecordValue -Record $Record -Name 'Action'
-        Target        = Get-JsonRecordValue -Record $Record -Name 'Target'
-        TargetType    = Get-JsonRecordValue -Record $Record -Name 'TargetType'
-        Status        = Get-JsonRecordValue -Record $Record -Name 'Status'
-        Message       = Get-JsonRecordValue -Record $Record -Name 'Message'
-        Details       = Get-JsonRecordValue -Record $Record -Name 'Details'
-        Source        = Get-JsonRecordValue -Record $Record -Name 'Source'
-        CorrelationId = Get-JsonRecordValue -Record $Record -Name 'CorrelationId'
+$modulePath = Join-Path $scriptDirectory 'Modules\ADAutoX.psd1'
+Import-Module $modulePath -ErrorAction Stop
+$reportParameters = @{
+    LogPath = $resolvedAuditLogPath
+    Summary = $true
+    ErrorOnMalformedEntries = $true
+}
+foreach ($parameterName in @('Identity', 'Action', 'Status')) {
+    if ($PSBoundParameters.ContainsKey($parameterName)) {
+        $reportParameters[$parameterName] = $PSBoundParameters[$parameterName]
     }
 }
+if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+    $reportParameters.OutputPath = $OutputPath
+    $reportParameters.AsJson = [bool]$AsJson
+}
+
+$summary = Get-ADAutoXAuditReport @reportParameters -ErrorAction Stop
 
 function Write-ADAuditSummaryToConsole {
     param(
@@ -135,88 +113,13 @@ function Write-ADAuditSummaryToConsole {
     Write-Host '========================================' -ForegroundColor Cyan
 }
 
-$resolvedAuditLogPath = if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
-    Join-Path $scriptDirectory 'AD-Operations.jsonl'
-}
-else {
-    $AuditLogPath
-}
-
-$resolvedAuditLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedAuditLogPath)
-Import-Module (Join-Path $scriptDirectory 'Modules\ADAutoX.psd1') -ErrorAction Stop
-$rawRecords = @(
-    Get-ADAutoXAuditReport -LogPath $resolvedAuditLogPath -Identity $Identity -Action $Action -Status $Status -ErrorOnMalformedEntries |
-        ForEach-Object { Get-ADAuditRecordObject -Record $_ }
-)
-
-if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
-    $outputDirectory = Split-Path -Parent $OutputPath
-    if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-    }
-}
-
-$summary = [pscustomobject]@{
-    AuditLogPath = $resolvedAuditLogPath
-    TotalRecords = $rawRecords.Count
-    UniqueActors = @($rawRecords | Select-Object -ExpandProperty Actor -Unique).Count
-    UniqueTargets = @($rawRecords | Select-Object -ExpandProperty Target -Unique).Count
-    FirstTimestamp = ''
-    LastTimestamp = ''
-    StatusCounts = @()
-    ActionCounts = @()
-    FailedRecords = @()
-}
-
-if ($rawRecords.Count -gt 0) {
-    $timestampValues = @($rawRecords | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Timestamp) } | Select-Object -ExpandProperty Timestamp)
-    if ($timestampValues.Count -gt 0) {
-        $sortedTimestamps = @($timestampValues | Sort-Object)
-        $summary.FirstTimestamp = $sortedTimestamps[0]
-        $summary.LastTimestamp = $sortedTimestamps[-1]
-    }
-
-    $summary.StatusCounts = @(
-        foreach ($statusName in @('Started', 'Succeeded', 'Failed', 'Skipped', 'Preview', 'CompletedWithErrors')) {
-            $count = @($rawRecords | Where-Object { $_.Status -ieq $statusName }).Count
-            if ($count -gt 0) {
-                [pscustomobject]@{
-                    Status = $statusName
-                    Count = $count
-                }
-            }
-        }
-    )
-
-    $summary.ActionCounts = @(
-        $rawRecords |
-            Group-Object -Property Action |
-            Sort-Object -Property Count -Descending |
-            Select-Object @{Name = 'Action'; Expression = { $_.Name } }, Count
-    )
-
-    $summary.FailedRecords = @(
-        $rawRecords |
-            Where-Object { $_.Status -ieq 'Failed' } |
-            Select-Object Timestamp, Actor, Action, Target, Message, Details
-    )
-}
-
 if ($AsJson) {
     $summary | ConvertTo-Json -Depth 8
-    if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $summary | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
-    }
 }
 else {
     Write-ADAuditSummaryToConsole -Summary $summary -IdentityFilter $Identity -ActionFilter $Action -StatusFilter $Status
 
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $rawRecords |
-            Select-Object Timestamp, Actor, Operator, Computer, Action, Target, TargetType, Status, Message, Details, Source, CorrelationId |
-            Export-Csv -LiteralPath $OutputPath -NoTypeInformation -Force -Encoding UTF8
-
         Write-Host "Detailed audit export written to: $OutputPath" -ForegroundColor Green
     }
 }

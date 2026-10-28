@@ -34,4 +34,4 @@ foreach ($name in 'AuditLogPath','Server','Credential') {
 if ($PSBoundParameters.ContainsKey('NewPassword')) { $arguments.NewPassword = $NewPassword }
 if ($WhatIfPreference) { $arguments.WhatIf = $true }
 if ($PSBoundParameters.ContainsKey('Confirm')) { $arguments.Confirm = $PSBoundParameters['Confirm'] }
-Invoke-ADAutoXUserLifecycle @arguments
+Invoke-ADAutoXUserAction @arguments

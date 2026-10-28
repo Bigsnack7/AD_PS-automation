@@ -22,4 +22,4 @@ foreach ($name in 'AllowDestructiveOperation','Server','Credential','AuditLogPat
 }
 if ($WhatIfPreference) { $arguments.WhatIf = $true }
 if ($PSBoundParameters.ContainsKey('Confirm')) { $arguments.Confirm = $PSBoundParameters['Confirm'] }
-Terminate-ADAutoXUser @arguments
+Stop-ADAutoXUser @arguments
