@@ -12,13 +12,13 @@
     Note that LastLogonDate is derived from lastLogonTimestamp and can lag by up to 14 days.
 
 .EXAMPLE
-    .\Export-Test-Users.ps1 -OrganizationalUnitName 'Company'
+    .\Cmdlets\Export-Test-Users.ps1 -OrganizationalUnitName 'Company'
 
 .EXAMPLE
-    .\Export-Test-Users.ps1 -OrganizationalUnitName 'Company' -OutputPath '.\company-users.csv'
+    .\Cmdlets\Export-Test-Users.ps1 -OrganizationalUnitName 'Company' -OutputPath '.\company-users.csv'
 
 .EXAMPLE
-    .\Export-Test-Users.ps1 -OrganizationalUnitName 'Company' -IncludeGroupMembership
+    .\Cmdlets\Export-Test-Users.ps1 -OrganizationalUnitName 'Company' -IncludeGroupMembership
 #>
 [CmdletBinding()]
 param(
@@ -46,7 +46,9 @@ if ([string]::IsNullOrEmpty($scriptDirectory) -and $MyInvocation.MyCommand.Path)
 if ([string]::IsNullOrEmpty($scriptDirectory)) {
     throw 'Cannot determine the script directory. Run this file from disk, not pasted into a console.'
 }
-$operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+$repositoryRoot = Split-Path -Parent $scriptDirectory
+$operationsModule = Join-Path $repositoryRoot 'Modules\AD-Operations.psm1'
+$scriptDirectory = $repositoryRoot
 
 if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
     throw "Required module not found: $operationsModule"

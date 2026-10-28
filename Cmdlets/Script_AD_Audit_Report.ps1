@@ -3,19 +3,18 @@
     Produces a summary report from the JSONL audit log created by the AD toolkit.
 
 .DESCRIPTION
-    Reads AD-Operations.jsonl (or a supplied audit log path), normalizes the JSON records,
-    applies optional filters, and prints a human-readable summary to the console. When
-    -OutputPath is supplied, it also exports the filtered records as a CSV timeline.
+    Reads AD-Operations.jsonl (or a supplied audit log path) through the shared ADAutoX audit
+    reader, normalizes the records, applies optional filters, and prints a human-readable summary
+    to the console. When -OutputPath is supplied, it also exports the filtered records as a CSV
+    timeline.
 
-    This report script intentionally does not run the shared Assert-ADOperationsDependencies
-    validation because it is a read-only reporting utility that consumes the audit log directly
-    rather than performing AD management operations.
-
-.EXAMPLE
-    .\Script_AD_Audit_Report.ps1
+    This read-only report does not require Active Directory connectivity.
 
 .EXAMPLE
-    .\Script_AD_Audit_Report.ps1 -AuditLogPath .\AD-Operations.jsonl -Identity jdoe -OutputPath .\jdoe-audit.csv
+    .\Cmdlets\Script_AD_Audit_Report.ps1
+
+.EXAMPLE
+    .\Cmdlets\Script_AD_Audit_Report.ps1 -AuditLogPath .\AD-Operations.jsonl -Identity jdoe -OutputPath .\jdoe-audit.csv
 #>
 [CmdletBinding()]
 param(
@@ -36,12 +35,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
 
-# Safely read a JSON record's property without tripping Set-StrictMode.
-# Dotting into a non-existent property (e.g. $Record.Details) throws under
-# strict mode; indexing into .PSObject.Properties never does, even for a
-# missing key, so this is the safe way to normalize variable-shaped records.
 function Get-JsonRecordValue {
     param(
         [Parameter(Mandatory)][psobject]$Record,
@@ -74,43 +69,6 @@ function Get-ADAuditRecordObject {
         Source        = Get-JsonRecordValue -Record $Record -Name 'Source'
         CorrelationId = Get-JsonRecordValue -Record $Record -Name 'CorrelationId'
     }
-}
-
-function Get-ADAuditRecords {
-    param(
-        [Parameter(Mandatory)][string]$Path
-    )
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Audit log '$Path' was not found."
-    }
-
-    $records = [System.Collections.Generic.List[object]]::new()
-    $lineNumber = 0
-
-    foreach ($line in Get-Content -LiteralPath $Path -ErrorAction Stop) {
-        $lineNumber++
-        $trimmed = $line.Trim()
-
-        if ([string]::IsNullOrWhiteSpace($trimmed)) {
-            continue
-        }
-
-        try {
-            $parsedRecord = $trimmed | ConvertFrom-Json -ErrorAction Stop
-        }
-        catch {
-            throw "Invalid JSON in audit log '$Path' on line ${lineNumber}: $($_.Exception.Message)"
-        }
-
-        if ($null -eq $parsedRecord) {
-            continue
-        }
-
-        $records.Add((Get-ADAuditRecordObject -Record $parsedRecord))
-    }
-
-    return $records.ToArray()
 }
 
 function Write-ADAuditSummaryToConsole {
@@ -184,43 +142,19 @@ else {
     $AuditLogPath
 }
 
-$resolvedAuditLogPath = [System.IO.Path]::GetFullPath($resolvedAuditLogPath)
-if (-not (Test-Path -LiteralPath $resolvedAuditLogPath -PathType Leaf)) {
-    throw "Audit log '$resolvedAuditLogPath' was not found."
-}
+$resolvedAuditLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($resolvedAuditLogPath)
+Import-Module (Join-Path $scriptDirectory 'Modules\ADAutoX.psd1') -ErrorAction Stop
+$rawRecords = @(
+    Get-ADAutoXAuditReport -LogPath $resolvedAuditLogPath -Identity $Identity -Action $Action -Status $Status -ErrorOnMalformedEntries |
+        ForEach-Object { Get-ADAuditRecordObject -Record $_ }
+)
 
-$rawRecords = @(Get-ADAuditRecords -Path $resolvedAuditLogPath)
-
-if ($Identity) {
-    $rawRecords = @(
-        $rawRecords | Where-Object {
-            $searchText = @(
-                $_.Actor,
-                $_.Operator,
-                $_.Target,
-                $_.TargetType,
-                $_.Action,
-                $_.Message,
-                $_.Details,
-                $_.Source,
-                $_.CorrelationId
-            ) -join ' '
-
-            $searchText -match [regex]::Escape($Identity)
-        }
-    )
-}
-
-if ($Action) {
-    $rawRecords = @(
-        $rawRecords | Where-Object { $_.Action -ieq $Action }
-    )
-}
-
-if ($Status) {
-    $rawRecords = @(
-        $rawRecords | Where-Object { $_.Status -ieq $Status }
-    )
+if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+    $OutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputPath)
+    $outputDirectory = Split-Path -Parent $OutputPath
+    if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
 }
 
 $summary = [pscustomobject]@{
@@ -279,11 +213,6 @@ else {
     Write-ADAuditSummaryToConsole -Summary $summary -IdentityFilter $Identity -ActionFilter $Action -StatusFilter $Status
 
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
-        $outputDirectory = Split-Path -Parent $OutputPath
-        if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory)) {
-            New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-        }
-
         $rawRecords |
             Select-Object Timestamp, Actor, Operator, Computer, Action, Target, TargetType, Status, Message, Details, Source, CorrelationId |
             Export-Csv -LiteralPath $OutputPath -NoTypeInformation -Force -Encoding UTF8

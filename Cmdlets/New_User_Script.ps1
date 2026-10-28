@@ -32,7 +32,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$scriptDirectory = $PSScriptRoot
+$scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
 if ([string]::IsNullOrEmpty($scriptDirectory) -and $MyInvocation.MyCommand.Path) {
     $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
@@ -49,7 +49,7 @@ else {
     $AuditLogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($AuditLogPath)
 }
 
-$operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+$operationsModule = Join-Path $scriptDirectory 'Modules\AD-Operations.psm1'
 
 if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
     throw "Required module not found: $operationsModule"
@@ -85,7 +85,8 @@ try {
     $targetOuArguments = @{}
     if (-not [string]::IsNullOrWhiteSpace($Server)) { $targetOuArguments['Server'] = $Server }
     if ($Credential) { $targetOuArguments['Credential'] = $Credential }
-    Get-TargetOU $Path @targetOuArguments | Out-Null
+    $targetOu = Get-TargetOU $Path @targetOuArguments
+    $targetOuDistinguishedName = $targetOu.DistinguishedName
 
     if (-not $UserPrincipalName) {
         $UserPrincipalName = "$SamAccountName@$((Get-ADDomain @adContext).DNSRoot)"
@@ -109,7 +110,7 @@ try {
         UserPrincipalName     = $UserPrincipalName
         Name                  = $displayName
         DisplayName           = $displayName
-        Path                  = $Path
+        Path                  = $targetOuDistinguishedName
         Enabled               = $expectedEnabled
         ChangePasswordAtLogon = (-not $NoChangePasswordAtLogon.IsPresent)
         PassThru              = $true
@@ -128,9 +129,8 @@ try {
         }
     }
 
-    Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Started' -Details "Creating user '$SamAccountName' in OU '$Path'."
-
     if ($PSCmdlet.ShouldProcess($SamAccountName, 'Create Active Directory user')) {
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Started' -Details "Creating user '$SamAccountName' in OU '$targetOuDistinguishedName'."
         $createdUser = New-ADUser @adContext @params
 
         # Verify by ObjectGUID: -Identity with a SamAccountName that looks like a SID or
@@ -154,11 +154,18 @@ try {
             throw "Create verification failed for '$SamAccountName': $($verificationIssues -join ' ') The account WAS created ($($verifiedUser.DistinguishedName)) and needs manual review."
         }
 
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Succeeded' -Details "Created and verified user '$SamAccountName' in OU '$Path'."
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Succeeded' -Details "Created and verified user '$SamAccountName' in OU '$targetOuDistinguishedName'."
         Write-Host "Created $SamAccountName" -ForegroundColor Green
     }
     else {
-        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status 'Preview' -Details "Preview only: would create user '$SamAccountName' in OU '$Path'."
+        $status = if ($WhatIfPreference) { 'Preview' } else { 'Skipped' }
+        $details = if ($WhatIfPreference) {
+            "Preview only: would create user '$SamAccountName' in OU '$targetOuDistinguishedName'."
+        }
+        else {
+            "Creation of user '$SamAccountName' in OU '$targetOuDistinguishedName' was declined."
+        }
+        Write-ADAuditRecord -Path $AuditLogPath -Action 'CreateUser' -Target $SamAccountName -TargetType 'User' -Status $status -Details $details
     }
 }
 catch {

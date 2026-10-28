@@ -16,10 +16,10 @@
     Suppresses the per-object confirmation prompts (ConfirmImpact is High). Ignored with -WhatIf.
 
 .EXAMPLE
-    .\2_RESET_TEST_USERS.ps1 -DeleteEverything -WhatIf
+    .\Cmdlets\2_RESET_TEST_USERS.ps1 -DeleteEverything -WhatIf
 
 .EXAMPLE
-    .\2_RESET_TEST_USERS.ps1 -DeleteEverything -AllowDestructiveOperation `
+    .\Cmdlets\2_RESET_TEST_USERS.ps1 -DeleteEverything -AllowDestructiveOperation `
         -ExpectedDistinguishedName 'OU=Company,DC=example,DC=com' -Force
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -48,14 +48,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
 
 if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
     $AuditLogPath = Join-Path $scriptDirectory 'AD-Operations.jsonl'
 }
 
 Import-Module ActiveDirectory -ErrorAction Stop
-$operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+$operationsModule = Join-Path $scriptDirectory 'Modules\AD-Operations.psm1'
 
 if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
     throw "Required module not found: $operationsModule"
@@ -64,28 +64,14 @@ if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
 Import-Module $operationsModule -Force
 Assert-ADOperationsDependencies
 
-# Counts unescaped commas, so a shallow OU with a long name is never mistaken for a deeper object.
-# Scans character by character so both "CN=O\,Brien" (escaped comma) and a name ending in an
-# escaped backslash ("CN=a\\,OU=x") are handled correctly.
-function Get-DistinguishedNameDepth {
-    param([Parameter(Mandatory)][string]$DistinguishedName)
-
-    $depth = 1
-    $escaped = $false
-    foreach ($character in $DistinguishedName.ToCharArray()) {
-        if ($escaped) { $escaped = $false; continue }
-        if ($character -eq '\') { $escaped = $true; continue }
-        if ($character -eq ',') { $depth++ }
-    }
-    return $depth
-}
-
 if ($Force -and -not $WhatIfPreference) { $ConfirmPreference = 'None' }
 
 $auditStarted = $false
 $removedUsers = 0
 $removedOUs = 0
 $removedOtherObjects = 0
+$adContext = @{}
+$clearedProtectionDistinguishedNames = [System.Collections.Generic.List[string]]::new()
 
 try {
     $null = Set-ADToolContext -Server $Server -Credential $Credential
@@ -138,7 +124,7 @@ try {
     # One enumeration, deepest objects first, so children are always removed before their parents.
     $allObjects = @(Get-ADObject @adContext -SearchBase $ouPath -SearchScope Subtree -Filter * -ErrorAction Stop |
         Where-Object { $_.DistinguishedName -ne $ouPath } |
-        Sort-Object -Property @{ Expression = { Get-DistinguishedNameDepth $_.DistinguishedName }; Descending = $true })
+        Sort-Object -Property @{ Expression = { Get-ADDistinguishedNameDepth -DistinguishedName $_.DistinguishedName }; Descending = $true })
     $users = @($allObjects | Where-Object { $_.ObjectClass -eq 'user' })
     $childOUs = @($allObjects | Where-Object { $_.ObjectClass -eq 'organizationalUnit' })
     $otherObjects = @($allObjects | Where-Object { $_.ObjectClass -notin @('user', 'organizationalUnit') })
@@ -160,6 +146,7 @@ try {
         foreach ($protectedOU in $protectedOUs) {
             if ($PSCmdlet.ShouldProcess($protectedOU.DistinguishedName, 'Clear accidental-deletion protection')) {
                 Set-ADObject @adContext -Identity $protectedOU.DistinguishedName -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
+                $clearedProtectionDistinguishedNames.Add($protectedOU.DistinguishedName)
             }
         }
     }
@@ -168,6 +155,9 @@ try {
         foreach ($object in $allObjects) {
             if ($PSCmdlet.ShouldProcess($object.DistinguishedName, "Remove $($object.ObjectClass)")) {
                 Remove-ADObject @adContext -Identity $object.DistinguishedName -Confirm:$false -ErrorAction Stop
+                if ($object.ObjectClass -eq 'organizationalUnit') {
+                    [void]$clearedProtectionDistinguishedNames.Remove($object.DistinguishedName)
+                }
                 switch ($object.ObjectClass) {
                     'user' { $removedUsers++ }
                     'organizationalUnit' { $removedOUs++ }
@@ -192,6 +182,7 @@ try {
             foreach ($childOU in $childOUs) {
                 if ($PSCmdlet.ShouldProcess($childOU.DistinguishedName, 'Remove child organizational unit')) {
                     Remove-ADOrganizationalUnit @adContext -Identity $childOU.DistinguishedName -Confirm:$false -ErrorAction Stop
+                    [void]$clearedProtectionDistinguishedNames.Remove($childOU.DistinguishedName)
                     $removedOUs++
                     Write-Host "Removed OU: $($childOU.DistinguishedName)" -ForegroundColor Cyan
                 }
@@ -202,6 +193,7 @@ try {
     if ($RemoveOrganizationalUnit) {
         if ($PSCmdlet.ShouldProcess($ouPath, 'Remove organizational unit')) {
             Remove-ADOrganizationalUnit @adContext -Identity $ouPath -Confirm:$false -ErrorAction Stop
+            [void]$clearedProtectionDistinguishedNames.Remove($ouPath)
             $removedOUs++
             Write-Host "Removed OU: $ouPath" -ForegroundColor Cyan
         }
@@ -232,5 +224,15 @@ catch {
     throw
 }
 finally {
+    foreach ($distinguishedName in @($clearedProtectionDistinguishedNames)) {
+        try {
+            Set-ADObject @adContext -Identity $distinguishedName -ProtectedFromAccidentalDeletion $true -Confirm:$false -ErrorAction Stop
+        }
+        catch {
+            if (-not (Test-ADIdentityNotFoundError -ErrorRecord $_)) {
+                Write-Warning "Failed to restore accidental-deletion protection on '$distinguishedName': $($_.Exception.Message)"
+            }
+        }
+    }
     Clear-ADToolContext
 }

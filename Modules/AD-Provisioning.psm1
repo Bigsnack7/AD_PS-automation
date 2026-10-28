@@ -452,11 +452,11 @@ function Initialize-ADProvisioning {
         [switch]$WhatIf
     )
 
-    $scriptDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
+    $scriptDirectory = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { (Get-Location).ProviderPath }
     $resolvedDepartments = @(Validate-ADProvisioningInput -Departments $Departments -OrganizationalUnitName $OrganizationalUnitName -StaffNamesOrganizationalUnitName $StaffNamesOrganizationalUnitName -NamesPath $NamesPath -ReportPath $ReportPath -AuditLogPath $AuditLogPath -AccountCount $AccountCount)
 
     if ([string]::IsNullOrWhiteSpace($NamesPath)) {
-        $NamesPath = Join-Path $scriptDirectory 'nigerian-names.txt'
+        $NamesPath = Join-Path $scriptDirectory 'Data\sample-names.txt'
     }
     if ([string]::IsNullOrWhiteSpace($AuditLogPath)) {
         $AuditLogPath = Join-Path $scriptDirectory 'AD-Operations.jsonl'
@@ -500,7 +500,7 @@ function Initialize-ADProvisioning {
     # Do NOT force-reload AD-Operations when it is already loaded: -Force resets its script-scoped
     # context state while the global AD defaults/drive from an earlier Set-ADToolContext remain.
     if (-not (Get-Module -Name 'AD-Operations')) {
-        $operationsModule = Join-Path $scriptDirectory 'AD-Operations.psm1'
+        $operationsModule = Join-Path $PSScriptRoot 'AD-Operations.psm1'
         if (-not (Test-Path -LiteralPath $operationsModule -PathType Leaf)) {
             throw "Required module not found: $operationsModule"
         }
@@ -628,55 +628,42 @@ function Test-ADProvisioningPreflight {
 
     $checks = [System.Collections.Generic.List[psobject]]::new()
 
-    function Add-PreflightCheck {
-        param(
-            [string]$Name,
-            [string]$Status,
-            [string]$Details = ''
-        )
-        $checks.Add([pscustomobject]@{
-                Name = $Name
-                Status = $Status
-                Details = $Details
-            })
-    }
-
     if (-not (Get-Command Get-ADDomain -ErrorAction SilentlyContinue)) {
-        Add-PreflightCheck -Name 'AD module' -Status 'Failed' -Details 'Active Directory module not available.'
+        Add-ADPreflightCheck -Checks $checks -Name 'AD module' -Status 'Failed' -Details 'Active Directory module not available.'
     }
     else {
-        Add-PreflightCheck -Name 'AD module' -Status 'Passed' -Details 'Active Directory module loaded.'
+        Add-ADPreflightCheck -Checks $checks -Name 'AD module' -Status 'Passed' -Details 'Active Directory module loaded.'
     }
 
     try {
         $null = Get-ADDomain @script:adContext -ErrorAction Stop
-        Add-PreflightCheck -Name 'Domain connectivity' -Status 'Passed' -Details "Domain root resolved to '$($State.DomainRoot)'."
+        Add-ADPreflightCheck -Checks $checks -Name 'Domain connectivity' -Status 'Passed' -Details "Domain root resolved to '$($State.DomainRoot)'."
     }
     catch {
-        Add-PreflightCheck -Name 'Domain connectivity' -Status 'Failed' -Details $_.Exception.Message
+        Add-ADPreflightCheck -Checks $checks -Name 'Domain connectivity' -Status 'Failed' -Details $_.Exception.Message
     }
 
     # The names file is only consumed when standard accounts are generated.
     if ($State.AdministratorsOnly) {
-        Add-PreflightCheck -Name 'Names file' -Status 'Passed' -Details 'Not required for an administrators-only run.'
+        Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Passed' -Details 'Not required for an administrators-only run.'
     }
     elseif (-not [string]::IsNullOrWhiteSpace($State.NamesPath) -and -not (Test-Path -LiteralPath $State.NamesPath -PathType Leaf)) {
-        Add-PreflightCheck -Name 'Names file' -Status 'Failed' -Details "Names file not found: $($State.NamesPath)"
+        Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Failed' -Details "Names file not found: $($State.NamesPath)"
     }
     else {
-        Add-PreflightCheck -Name 'Names file' -Status 'Passed' -Details "Names file resolved to '$($State.NamesPath)'."
+        Add-ADPreflightCheck -Checks $checks -Name 'Names file' -Status 'Passed' -Details "Names file resolved to '$($State.NamesPath)'."
     }
 
     foreach ($department in $State.Departments) {
         $departmentName = $department.Trim()
-        Add-PreflightCheck -Name "Department name: $departmentName" -Status 'Passed' -Details "Validated department '$departmentName'."
+        Add-ADPreflightCheck -Checks $checks -Name "Department name: $departmentName" -Status 'Passed' -Details "Validated department '$departmentName'."
     }
 
     if ($State.CreateDepartmentAdministrators -and -not [string]::IsNullOrWhiteSpace($State.AdministratorUsername) -and $State.Departments.Count -gt 1 -and -not $State.AdministratorUsername.Contains('{0}')) {
-        Add-PreflightCheck -Name 'Administrator username template' -Status 'Failed' -Details "When creating department administrators for multiple departments, -AdministratorUsername must include {0}."
+        Add-ADPreflightCheck -Checks $checks -Name 'Administrator username template' -Status 'Failed' -Details "When creating department administrators for multiple departments, -AdministratorUsername must include {0}."
     }
     else {
-        Add-PreflightCheck -Name 'Administrator username template' -Status 'Passed' -Details 'Administrator naming pattern is valid for the requested department layout.'
+        Add-ADPreflightCheck -Checks $checks -Name 'Administrator username template' -Status 'Passed' -Details 'Administrator naming pattern is valid for the requested department layout.'
     }
 
     $summary = [pscustomobject]@{
@@ -1203,8 +1190,26 @@ function Set-DepartmentDelegation {
         return [pscustomobject]@{ GroupName = $GroupName; TargetOuDistinguishedName = $TargetOuDistinguishedName; Status = 'AlreadyPresent' }
     }
 
-    $accessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($groupSid, $managedAccessRights, 'Allow', $userClassGuid, [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents, $userClassGuid)
-    $acl.AddAccessRule($accessRule)
+    $childManagementRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
+        [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild
+    $childManagementRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        $groupSid,
+        $childManagementRights,
+        'Allow',
+        $userClassGuid,
+        [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None
+    )
+    $acl.AddAccessRule($childManagementRule)
+
+    $descendantAccessRule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
+        $groupSid,
+        $managedAccessRights,
+        'Allow',
+        $userClassGuid,
+        [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents,
+        $userClassGuid
+    )
+    $acl.AddAccessRule($descendantAccessRule)
     Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
 
     # Verify the grant actually landed instead of trusting that Set-Acl did not throw.

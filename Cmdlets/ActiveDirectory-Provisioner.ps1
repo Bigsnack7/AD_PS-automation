@@ -117,7 +117,7 @@ if ($ExportPasswords) {
 }
 
 # --- Forward only what the caller supplied, after checking the target accepts it -----------
-$canonicalCommand = Get-Command -LiteralPath $canonicalScriptPath -CommandType ExternalScript
+$canonicalCommand = Get-Command -Name $canonicalScriptPath -CommandType ExternalScript -ErrorAction Stop
 $commonParameters = @([System.Management.Automation.PSCmdlet]::CommonParameters) +
                     @([System.Management.Automation.PSCmdlet]::OptionalCommonParameters)
 
