@@ -4,6 +4,7 @@ param(
     [ValidateNotNullOrEmpty()][string]$TerminationOU,
     [ValidateNotNullOrEmpty()][string]$TerminationReason = 'Terminated',
     [switch]$AllowDestructiveOperation,
+    [switch]$AllowProtectedAccount,
     [string]$Server,
     [PSCredential]$Credential,
     [string]$AuditLogPath = ''
@@ -17,7 +18,7 @@ $arguments = @{
     Reason = $TerminationReason
 }
 if ($PSBoundParameters.ContainsKey('TerminationOU')) { $arguments.TargetPath = $TerminationOU }
-foreach ($name in 'AllowDestructiveOperation','Server','Credential','AuditLogPath') {
+foreach ($name in 'AllowDestructiveOperation','AllowProtectedAccount','Server','Credential','AuditLogPath') {
     if ($PSBoundParameters.ContainsKey($name)) { $arguments[$name] = $PSBoundParameters[$name] }
 }
 if ($WhatIfPreference) { $arguments.WhatIf = $true }

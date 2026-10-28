@@ -7,6 +7,7 @@ param(
     [switch]$IncludeNeverLoggedOn,
     [ValidateNotNullOrEmpty()][string]$CsvPath,
     [switch]$AllowDestructiveOperation,
+    [switch]$AllowProtectedAccount,
     [string]$Server,
     [PSCredential]$Credential,
     [string]$AuditLogPath = ''
@@ -18,7 +19,7 @@ Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) 'Modules\ADAutoX.psd
 
 if ($Identity) {
     $arguments = @{ Identity = $Identity }
-    foreach ($name in 'AllowDestructiveOperation','Server','Credential','AuditLogPath') {
+    foreach ($name in 'AllowDestructiveOperation','AllowProtectedAccount','Server','Credential','AuditLogPath') {
         if ($PSBoundParameters.ContainsKey($name)) { $arguments[$name] = $PSBoundParameters[$name] }
     }
     if ($WhatIfPreference) { $arguments.WhatIf = $true }
@@ -31,7 +32,7 @@ if ($Identity) {
 }
 
 $arguments = @{}
-foreach ($name in 'InactiveDays','SearchBase','AllowDomainWide','IncludeNeverLoggedOn','AllowDestructiveOperation','CsvPath','Server','Credential','AuditLogPath') {
+foreach ($name in 'InactiveDays','SearchBase','AllowDomainWide','IncludeNeverLoggedOn','AllowDestructiveOperation','AllowProtectedAccount','CsvPath','Server','Credential','AuditLogPath') {
     if ($PSBoundParameters.ContainsKey($name)) { $arguments[$name] = $PSBoundParameters[$name] }
 }
 if ($WhatIfPreference) { $arguments.WhatIf = $true }

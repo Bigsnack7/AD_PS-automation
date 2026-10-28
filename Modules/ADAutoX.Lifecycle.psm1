@@ -412,21 +412,21 @@ function Enable-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$Identity, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $arguments = @{ Action = 'Enable'; Identity = $Identity; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Disable-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param([Parameter(Mandatory)][string]$Identity, [switch]$AllowDestructiveOperation, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $arguments = @{ Action = 'Disable'; Identity = $Identity; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Unlock-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$Identity, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $arguments = @{ Action = 'Unlock'; Identity = $Identity; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Reset-ADAutoXUserPassword {
@@ -442,28 +442,28 @@ function Reset-ADAutoXUserPassword {
         AuditLogPath = $AuditLogPath
     }
     if ($PSBoundParameters.ContainsKey('NewPassword')) { $parameters.NewPassword = $NewPassword }
-    Invoke-ADAutoXLifecycleAction -Arguments $parameters -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $parameters -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Move-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$Identity, [Parameter(Mandatory)][string]$TargetPath, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $arguments = @{ Action = 'Move'; Identity = $Identity; TargetPath = $TargetPath; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Stop-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param([Parameter(Mandatory)][string]$Identity, [string]$TargetPath, [ValidateNotNullOrEmpty()][string]$Reason = 'Terminated', [switch]$AllowDestructiveOperation, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $arguments = @{ Action = 'Terminate'; Identity = $Identity; TargetPath = $TargetPath; Reason = $Reason; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Remove-ADAutoXUser {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param([Parameter(Mandatory)][string]$Identity, [switch]$AllowDestructiveOperation, [switch]$AllowProtectedAccount, [string]$Server, [PSCredential]$Credential, [string]$AuditLogPath = '')
     $arguments = @{ Action = 'Delete'; Identity = $Identity; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Set-ADAutoXUserGroupMembership {
@@ -480,7 +480,7 @@ function Set-ADAutoXUserGroupMembership {
     )
     $action = if ($Operation -eq 'Add') { 'AddToGroup' } else { 'RemoveFromGroup' }
     $arguments = @{ Action = $action; Identity = $Identity; Group = $Group; AllowDestructiveOperation = $AllowDestructiveOperation; AllowProtectedAccount = $AllowProtectedAccount; Server = $Server; Credential = $Credential; AuditLogPath = $AuditLogPath }
-    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm $Confirm -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
+    Invoke-ADAutoXLifecycleAction -Arguments $arguments -WhatIf $WhatIfPreference -Confirm ([bool]$PSBoundParameters['Confirm']) -ConfirmBound ($PSBoundParameters.ContainsKey('Confirm'))
 }
 
 function Disable-ADAutoXInactiveUsers {

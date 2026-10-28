@@ -5,6 +5,7 @@ param(
     [switch]$AllowDomainWide,
     [switch]$IncludeNeverLoggedOn,
     [switch]$AllowDestructiveOperation,
+    [switch]$AllowProtectedAccount,
     [string]$CsvPath,
     [string]$Server,
     [PSCredential]$Credential,
@@ -16,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 $rootDirectory = Split-Path -Parent $PSScriptRoot
 Import-Module (Join-Path $rootDirectory 'Modules\ADAutoX.psd1') -ErrorAction Stop
 $arguments = @{}
-foreach ($name in 'InactiveDays','SearchBase','AllowDomainWide','IncludeNeverLoggedOn','AllowDestructiveOperation','CsvPath','Server','Credential','AuditLogPath') {
+foreach ($name in 'InactiveDays','SearchBase','AllowDomainWide','IncludeNeverLoggedOn','AllowDestructiveOperation','AllowProtectedAccount','CsvPath','Server','Credential','AuditLogPath') {
     if ($PSBoundParameters.ContainsKey($name)) { $arguments[$name] = $PSBoundParameters[$name] }
 }
 if ($WhatIfPreference) { $arguments.WhatIf = $true }

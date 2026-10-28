@@ -10,6 +10,7 @@ param(
     [SecureString]$NewPassword,
     [switch]$MustChangeAtLogon,
     [switch]$AllowDestructiveOperation,
+    [switch]$AllowProtectedAccount,
     [string]$AuditLogPath = '',
     [string]$Server,
     [PSCredential]$Credential
@@ -25,6 +26,7 @@ $arguments = @{
     Reason = $Reason
     MustChangeAtLogon = $MustChangeAtLogon
     AllowDestructiveOperation = $AllowDestructiveOperation
+    AllowProtectedAccount = $AllowProtectedAccount
 }
 if ($PSBoundParameters.ContainsKey('TargetOU')) { $arguments.TargetPath = $TargetOU }
 if ($PSBoundParameters.ContainsKey('Group')) { $arguments.Group = $Group }

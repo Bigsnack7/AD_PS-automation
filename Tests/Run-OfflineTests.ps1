@@ -662,6 +662,15 @@ $lifecycleAst = [System.Management.Automation.Language.Parser]::ParseFile(
     [ref]$lifecycleTokens,
     [ref]$lifecycleParseErrors
 )
+$safeConfirmForwardingCount = [regex]::Matches(
+    $lifecycleModuleSource,
+    '-Confirm \(\[bool\]\$PSBoundParameters\[''Confirm''\]\)'
+).Count
+$lifecycleConfirmForwardingIsStrictModeSafe = $safeConfirmForwardingCount -eq 8 -and
+    -not $lifecycleModuleSource.Contains('-Confirm $Confirm')
+Assert-True $lifecycleConfirmForwardingIsStrictModeSafe `
+    'Lifecycle wrappers safely forward Confirm when the common parameter is unbound'
+
 $protectedHelperAst = $lifecycleAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -728,12 +737,49 @@ $manageUserSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\
 $manageUserAlias = Get-Command Manage-ADAutoXUser -ErrorAction SilentlyContinue
 $manageUserExposesPhase1Actions = $manageUserSource.Contains("[ValidateSet('Disable', 'Enable', 'Unlock', 'Move', 'RemoveFromGroup', 'ResetPassword', 'Terminate')]") -and
     $manageUserSource.Contains("if (`$PSBoundParameters.ContainsKey('Group')) { `$arguments.Group = `$Group }") -and
+    $manageUserSource.Contains('AllowProtectedAccount = $AllowProtectedAccount') -and
     $manageUserSource.Contains('Invoke-ADAutoXUserAction @arguments') -and
     $null -ne $manageUserAlias -and
     $manageUserAlias.CommandType -eq 'Alias' -and
     $manageUserAlias.Definition -eq 'Invoke-ADAutoXUserAction'
 Assert-True $manageUserExposesPhase1Actions `
-    'User manager calls the approved action function and preserves its compatibility alias'
+    'User manager forwards protected-account approval through the approved action function and preserves its alias'
+
+$protectedAccountWrapperContracts = @(
+    @{ Script = 'Script_Disable_User.ps1'; Target = 'Disable-ADAutoXUser'; Forwarding = "foreach (`$name in 'AllowDestructiveOperation','AllowProtectedAccount','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Script_Delete_User.ps1'; Target = 'Remove-ADAutoXUser'; Forwarding = "foreach (`$name in 'AllowDestructiveOperation','AllowProtectedAccount','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Script_Move_User.ps1'; Target = 'Move-ADAutoXUser'; Forwarding = "foreach (`$name in 'AllowProtectedAccount','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Script_Reset_User_Passwords.ps1'; Target = 'Reset-ADAutoXUserPassword'; Forwarding = 'AllowProtectedAccount = $AllowProtectedAccount' },
+    @{ Script = 'Script_Add_User_to_Group.ps1'; Target = 'Set-ADAutoXUserGroupMembership'; Forwarding = "foreach (`$name in 'AllowProtectedAccount','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Script_Remove_User_from_Group.ps1'; Target = 'Set-ADAutoXUserGroupMembership'; Forwarding = "foreach (`$name in 'AllowDestructiveOperation','AllowProtectedAccount','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Script_Terminate_User.ps1'; Target = 'Stop-ADAutoXUser'; Forwarding = "foreach (`$name in 'AllowDestructiveOperation','AllowProtectedAccount','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Script_Disable_Inactive_Users.ps1'; Target = 'Disable-ADAutoXInactiveUsers'; Forwarding = "foreach (`$name in 'InactiveDays','SearchBase','AllowDomainWide','IncludeNeverLoggedOn','AllowDestructiveOperation','AllowProtectedAccount','CsvPath','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Disable-ADAutoXInactiveUsers.ps1'; Target = 'Disable-ADAutoXInactiveUsers'; Forwarding = "foreach (`$name in 'InactiveDays','SearchBase','AllowDomainWide','IncludeNeverLoggedOn','AllowDestructiveOperation','AllowProtectedAccount','CsvPath','Server','Credential','AuditLogPath')" },
+    @{ Script = 'Invoke-ADAutoXUserLifecycle.ps1'; Target = 'Invoke-ADAutoXUserLifecycle'; Forwarding = 'AllowProtectedAccount = $AllowProtectedAccount' }
+)
+$protectedAccountWrappersAreWired = $true
+foreach ($contract in $protectedAccountWrapperContracts) {
+    $wrapperPath = Join-Path $repoRoot "Cmdlets\$($contract.Script)"
+    $wrapperText = [System.IO.File]::ReadAllText($wrapperPath)
+    $wrapperTokens = $null
+    $wrapperParseErrors = $null
+    $wrapperAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $wrapperPath, [ref]$wrapperTokens, [ref]$wrapperParseErrors
+    )
+    $wrapperParameters = @($wrapperAst.ParamBlock.Parameters |
+        ForEach-Object { $_.Name.VariablePath.UserPath })
+    $targetCommand = Get-Command $contract.Target -ErrorAction SilentlyContinue
+    if ($wrapperParseErrors.Count -gt 0 -or
+        'AllowProtectedAccount' -notin $wrapperParameters -or
+        -not $wrapperText.Contains($contract.Forwarding) -or
+        $null -eq $targetCommand -or
+        -not $targetCommand.Parameters.ContainsKey('AllowProtectedAccount')) {
+        $protectedAccountWrappersAreWired = $false
+        break
+    }
+}
+Assert-True $protectedAccountWrappersAreWired `
+    'Lifecycle wrappers expose and forward protected-account approval to supporting module commands'
 
 $legacyLifecycleNames = @(
     'Script_Disable_Inactive_Users.ps1','Script_Disable_User.ps1','Script_Enable_User.ps1',

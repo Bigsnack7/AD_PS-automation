@@ -85,7 +85,7 @@ These legacy scripts preserve older command names or parameter interfaces and fo
 | --- | --- |
 | [`ActiveDirectory-Provisioner.ps1`](./Cmdlets/ActiveDirectory-Provisioner.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1) |
 | [`Generate-ADUsers.ps1`](./Cmdlets/Generate-ADUsers.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1), with legacy defaults |
-| [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | `Invoke-ADAutoXUserAction` |
+| [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | `Invoke-ADAutoXUserAction`; `-AllowProtectedAccount` is forwarded for guarded actions |
 | [`Remove-Test-Users.ps1`](./Cmdlets/Remove-Test-Users.ps1) | [`2_RESET_TEST_USERS.ps1`](./Cmdlets/2_RESET_TEST_USERS.ps1) |
 | [`Reset-ADAutoXEnvironment.ps1`](./Cmdlets/Reset-ADAutoXEnvironment.ps1) | `Invoke-ADAutoXLedgerRollback` with `-RollbackLedger`; otherwise [`Remove-Test-Users.ps1`](./Cmdlets/Remove-Test-Users.ps1) |
 | [`Script_AD_Audit_Report.ps1`](./Cmdlets/Script_AD_Audit_Report.ps1) | `Get-ADAutoXAuditReport` |
@@ -442,14 +442,14 @@ Run from the repository root. Most AD commands also accept `-Server`, `-Credenti
 
 | Script | Purpose | Key inputs |
 | --- | --- | --- |
-| [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | Preferred adapter | `-Identity`, `-Action` (`Disable`, `Enable`, `Unlock`, `Move`, `RemoveFromGroup`, `ResetPassword`, `Terminate`), optional `-TargetOU`, `-Group`, `-Reason`, secure `-NewPassword`, `-MustChangeAtLogon` |
-| [`Invoke-ADAutoXUserLifecycle.ps1`](./Cmdlets/Invoke-ADAutoXUserLifecycle.ps1) | General dispatcher | `-Action` (adds `Delete` and `AddToGroup`), `-Identity`, `-TargetPath`, `-Group`, `-Reason` |
+| [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | Preferred adapter | `-Identity`, `-Action` (`Disable`, `Enable`, `Unlock`, `Move`, `RemoveFromGroup`, `ResetPassword`, `Terminate`), optional `-TargetOU`, `-Group`, `-Reason`, secure `-NewPassword`, `-MustChangeAtLogon`, `-AllowProtectedAccount` |
+| [`Invoke-ADAutoXUserLifecycle.ps1`](./Cmdlets/Invoke-ADAutoXUserLifecycle.ps1) | General dispatcher | `-Action` (adds `Delete` and `AddToGroup`), `-Identity`, `-TargetPath`, `-Group`, `-Reason`, `-AllowProtectedAccount` |
 | `Script_Enable_User.ps1`, `Script_Unlock_User_Account.ps1` | Enable or unlock one account | `-Identity` |
-| `Script_Disable_User.ps1`, `Script_Delete_User.ps1` | Disable or delete one account | `-Identity`, `-AllowDestructiveOperation` (deletion is irreversible) |
-| `Script_Terminate_User.ps1` | Disable, optionally move to `-TerminationOU`, and append `-TerminationReason` to the description | `-Identity`, `-AllowDestructiveOperation`. Existing description text is kept and length is checked |
-| `Script_Move_User.ps1` | Move one account | `-Identity`, `-TargetPath` |
-| `Script_Add_User_to_Group.ps1`, `Script_Remove_User_from_Group.ps1` | Change group membership (verified) | `-Identity`, `-Group`; removal also needs `-AllowDestructiveOperation` |
-| `Script_Reset_User_Passwords.ps1` | Set a password | `-Identity`, secure `-NewPassword`, `-MustChangeAtLogon` |
+| `Script_Disable_User.ps1`, `Script_Delete_User.ps1` | Disable or delete one account | `-Identity`, `-AllowDestructiveOperation`, optional `-AllowProtectedAccount` |
+| `Script_Terminate_User.ps1` | Disable, optionally move to `-TerminationOU`, and append `-TerminationReason` to the description | `-Identity`, `-AllowDestructiveOperation`, optional `-AllowProtectedAccount`. Existing description text is kept and length is checked |
+| `Script_Move_User.ps1` | Move one account | `-Identity`, `-TargetPath`, optional `-AllowProtectedAccount` |
+| `Script_Add_User_to_Group.ps1`, `Script_Remove_User_from_Group.ps1` | Change group membership (verified) | `-Identity`, `-Group`, optional `-AllowProtectedAccount`; removal also needs `-AllowDestructiveOperation` |
+| `Script_Reset_User_Passwords.ps1` | Set a password | `-Identity`, secure `-NewPassword`, `-MustChangeAtLogon`, optional `-AllowProtectedAccount` |
 
 All of the `Script_*.ps1` files above live in [`Cmdlets/`](./Cmdlets).
 
@@ -457,7 +457,7 @@ All of the `Script_*.ps1` files above live in [`Cmdlets/`](./Cmdlets).
 
 | Script | Purpose | Key inputs |
 | --- | --- | --- |
-| `Script_Disable_Inactive_Users.ps1`, [`Disable-ADAutoXInactiveUsers.ps1`](./Cmdlets/Disable-ADAutoXInactiveUsers.ps1) | Disable one account or run the bulk inactivity workflow | `-InactiveDays` (default 90, 1–3650), `-SearchBase`, `-IncludeNeverLoggedOn`, `-CsvPath`; domain-wide scans need `-AllowDomainWide`; applying needs `-AllowDestructiveOperation` |
+| `Script_Disable_Inactive_Users.ps1`, [`Disable-ADAutoXInactiveUsers.ps1`](./Cmdlets/Disable-ADAutoXInactiveUsers.ps1) | Disable one account or run the bulk inactivity workflow | `-InactiveDays` (default 90, 1–3650), `-SearchBase`, `-IncludeNeverLoggedOn`, `-CsvPath`; domain-wide scans need `-AllowDomainWide`; applying needs `-AllowDestructiveOperation`; optional `-AllowProtectedAccount` |
 | `Script_Find_Locked-Out_Users.ps1`, [`Get-ADAutoXLockedOutUsers.ps1`](./Cmdlets/Get-ADAutoXLockedOutUsers.ps1) | Find locked-out accounts | `-SearchBase`, `-CsvPath` |
 | [`Get-ADAutoXSecurityScan.ps1`](./Cmdlets/Get-ADAutoXSecurityScan.ps1) | Structured posture scan: locked-out, password-never-expires, inactive | `-SearchBase`, `-InactiveDays`. Read-only |
 | `Script_AD_Security_Report.ps1` | Human-readable security summary including privileged users and department administrator counts | `-SearchBase`, `-DomainName`, `-Departments`, `-OrganizationalUnitName`. Without `-SearchBase` it falls back to a domain-wide scan, so set a scope deliberately |

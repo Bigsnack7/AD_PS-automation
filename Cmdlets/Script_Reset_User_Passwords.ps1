@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Identity,
     [SecureString]$NewPassword,
     [switch]$MustChangeAtLogon,
+    [switch]$AllowProtectedAccount,
     [string]$Server,
     [PSCredential]$Credential,
     [string]$AuditLogPath = ''
@@ -14,6 +15,7 @@ Import-Module (Join-Path (Split-Path -Parent $PSScriptRoot) 'Modules\ADAutoX.psd
 $arguments = @{
     Identity = $Identity
     MustChangeAtLogon = $MustChangeAtLogon
+    AllowProtectedAccount = $AllowProtectedAccount
 }
 foreach ($name in 'Server','Credential','AuditLogPath') {
     if ($PSBoundParameters.ContainsKey($name)) { $arguments[$name] = $PSBoundParameters[$name] }

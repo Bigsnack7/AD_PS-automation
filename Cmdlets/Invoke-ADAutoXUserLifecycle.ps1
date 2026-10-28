@@ -10,6 +10,7 @@ param(
     [SecureString]$NewPassword,
     [switch]$MustChangeAtLogon,
     [switch]$AllowDestructiveOperation,
+    [switch]$AllowProtectedAccount,
     [string]$Server,
     [PSCredential]$Credential,
     [string]$AuditLogPath = ''
@@ -28,6 +29,7 @@ $arguments = @{
     Reason = $Reason
     MustChangeAtLogon = $MustChangeAtLogon
     AllowDestructiveOperation = $AllowDestructiveOperation
+    AllowProtectedAccount = $AllowProtectedAccount
     Server = $Server
     Credential = $Credential
     AuditLogPath = $AuditLogPath
