@@ -43,6 +43,20 @@ function Assert-Throws {
 
 Write-Host 'Running AD_PS offline regression checks (no AD connection or Active Directory changes).' -ForegroundColor Cyan
 
+$singleProperty = switch ('Unlock') { 'Unlock' { @('LockedOut') } }
+$strictCountFailed = $false
+try {
+    $null = $singleProperty.Count
+}
+catch {
+    $strictCountFailed = $true
+}
+$lifecycleSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\ADAutoX.Lifecycle.psm1'))
+Assert-True ($singleProperty -is [string] -and $strictCountFailed -and @($singleProperty).Count -eq 1) `
+    'Strict mode reproduces the single-property scalar Count failure and array wrapping safely counts it'
+Assert-True ($lifecycleSource.Contains('elseif (@($properties).Count -gt 0)')) `
+    'Lifecycle post-change verification safely counts scalar or empty property selections'
+
 $rootPowerShellScripts = @(Get-ChildItem -LiteralPath $repoRoot -Filter '*.ps1' -File | Select-Object -ExpandProperty Name)
 $organizedPathsExist = (Test-Path -LiteralPath (Join-Path $repoRoot 'Modules\ADAutoX.psd1') -PathType Leaf) -and
     (Test-Path -LiteralPath (Join-Path $repoRoot 'Cmdlets\mark42.ps1') -PathType Leaf) -and

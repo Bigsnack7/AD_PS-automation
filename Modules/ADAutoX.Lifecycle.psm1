@@ -323,7 +323,7 @@ function Invoke-ADAutoXUserLifecycle {
                     throw "Group membership verification failed for '$($user.SamAccountName)' and '$($groupObject.Name)'."
                 }
             }
-            elseif ($properties.Count -gt 0) {
+            elseif (@($properties).Count -gt 0) {
                 $verifiedUser = Get-ADUser @adContext -Identity $user.SamAccountName -Properties $properties -ErrorAction Stop
                 switch ($Action) {
                     'Enable' { if (-not $verifiedUser.Enabled) { throw 'Enable verification failed: account remains disabled.' } }
