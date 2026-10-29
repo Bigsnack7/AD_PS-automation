@@ -710,8 +710,8 @@ function Invoke-ADAutoXLedgerRollback {
                             [System.DirectoryServices.ActiveDirectoryRights]::ListObject -bor
                             [System.DirectoryServices.ActiveDirectoryRights]::ReadControl -bor
                             [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty
-                        $ouPath = Get-ADProviderPath -DistinguishedName $item.DistinguishedName -Server $adContext.Server
-                        $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+                        $acl = Invoke-ADObjectAcl -Action Read -DistinguishedName $item.DistinguishedName `
+                            -ADContext $adContext
                         $rulesToRemove = @($acl.Access | Where-Object {
                             $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
                             $ruleSid -eq $groupSid.Value -and
@@ -734,9 +734,11 @@ function Invoke-ADAutoXLedgerRollback {
                             $acl.RemoveAccessRuleSpecific($rule)
                         }
                         if ($rulesToRemove.Count -gt 0) {
-                            Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
+                            Invoke-ADObjectAcl -Action Write -DistinguishedName $item.DistinguishedName `
+                                -ADContext $adContext -AclObject $acl
                         }
-                        $verifiedAcl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+                        $verifiedAcl = Invoke-ADObjectAcl -Action Read -DistinguishedName $item.DistinguishedName `
+                            -ADContext $adContext
                         $remainingRules = @($verifiedAcl.Access | Where-Object {
                             $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
                             $ruleSid -eq $groupSid.Value -and
@@ -1050,15 +1052,21 @@ function Invoke-ADAutoXPreflight {
                 else {
                     $groupSid = Get-ADValidatedSecurityGroupSid -Group $adminGroups[0] `
                         -ExpectedName $adminGroupName -ExpectedParentDistinguishedName $adminOuDn
-                    $aclPath = Get-ADProviderPath -DistinguishedName $departmentUsersDn -Server $ADContext.Server
-                    $acl = Get-Acl -LiteralPath $aclPath -ErrorAction Stop
-                    $delegationPresent = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
-                    $delegationStatus = if ($delegationPresent) { 'Passed' } else { 'Failed' }
-                    $delegationDetails = if ($delegationPresent) {
-                        "Delegation for '$adminGroupName' on '$departmentUsersDn' is already present for the validated group SID."
+                    $acl = Invoke-ADObjectAcl -Action Read -DistinguishedName $departmentUsersDn `
+                        -ADContext $ADContext -AllowMissing
+                    if ($null -eq $acl) {
+                        $delegationStatus = 'NeedsAttention'
+                        $delegationDetails = "Department Users OU '$departmentUsersDn' is not present yet and is pending creation; its ACL will be checked during Phase 2."
                     }
                     else {
-                        "Pre-existing administrator group '$adminGroupName' has no matching SID-scoped delegation on '$departmentUsersDn'; automatic delegation is refused."
+                        $delegationPresent = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
+                        $delegationStatus = if ($delegationPresent) { 'Passed' } else { 'Failed' }
+                        $delegationDetails = if ($delegationPresent) {
+                            "Delegation for '$adminGroupName' on '$departmentUsersDn' is already present for the validated group SID."
+                        }
+                        else {
+                            "Pre-existing administrator group '$adminGroupName' has no matching SID-scoped delegation on '$departmentUsersDn'; automatic delegation is refused."
+                        }
                     }
                 }
                 Add-ADPreflightCheck -Checks $checks -Name "Delegation state: $department" `

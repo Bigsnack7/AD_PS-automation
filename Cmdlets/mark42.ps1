@@ -1419,8 +1419,6 @@ function Grant-DepartmentUserDelegation {
         [string]$DomainNetBIOSName = ''
     )
 
-    $ouPath = Get-ADProviderPath -DistinguishedName $TargetOuDistinguishedName -Server $script:adContext.Server
-
     # Scoped OU delegation for the department user-object lifecycle role.
     # This intentionally excludes broad property-write access because attribute updates,
     # password resets, account unlocks, enable/disable operations, and other approved user
@@ -1449,7 +1447,8 @@ function Grant-DepartmentUserDelegation {
     }
 
     $groupSid = Get-ADValidatedSecurityGroupSid -Group $Group -ExpectedName $GroupName -ExpectedParentDistinguishedName $ExpectedGroupParentDistinguishedName
-    $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+    $acl = Invoke-ADObjectAcl -Action Read -DistinguishedName $TargetOuDistinguishedName `
+        -ADContext $script:adContext
     $alreadyGranted = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
     Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun `
         -PreviouslyCreatedByAutomation $PreviouslyCreatedByAutomation -ExistingDelegation $alreadyGranted
@@ -1512,12 +1511,14 @@ function Grant-DepartmentUserDelegation {
 
     Add-ResourceLedgerEntry -Type 'Delegation' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `
         -CreatedByThisRun $true -SecurityIdentifier $groupSid.Value -DelegationRuleTypes $delegationRuleTypes.ToArray()
-    Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
+    Invoke-ADObjectAcl -Action Write -DistinguishedName $TargetOuDistinguishedName `
+        -ADContext $script:adContext -AclObject $acl
 
-    # Verify the grant landed instead of trusting that Set-Acl did not throw.
-    $verifiedAcl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+    # Verify the grant landed instead of trusting the directory write response.
+    $verifiedAcl = Invoke-ADObjectAcl -Action Read -DistinguishedName $TargetOuDistinguishedName `
+        -ADContext $script:adContext
     if (-not (Test-ADUserLifecycleDelegation -AccessRules @($verifiedAcl.Access) -GroupSid $groupSid)) {
-        throw "Delegation for group '$GroupName' on '$TargetOuDistinguishedName' could not be verified after Set-Acl."
+        throw "Delegation for group '$GroupName' on '$TargetOuDistinguishedName' could not be verified after the directory ACL write."
     }
 
     Write-ADProvisioningAuditRecord -Action 'GrantDelegation' -Target $GroupName -TargetType 'Delegation' -Status 'Succeeded' -Details "Granted scoped user-object lifecycle delegation to '$GroupName' on '$TargetOuDistinguishedName'."

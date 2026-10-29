@@ -659,10 +659,24 @@ function Test-ADProvisioningTargetPermissions {
                 })
             continue
         }
-        $targetPath = Get-ADProviderPath -DistinguishedName $targetOu -Server $State.Server
-
         try {
-            $acl = Get-Acl -LiteralPath $targetPath -ErrorAction Stop
+            $acl = Invoke-ADObjectAcl -Action Read -DistinguishedName $targetOu `
+                -ADContext $State.ADContext -AllowMissing
+            if ($null -eq $acl) {
+                $checks.Add([pscustomobject]@{
+                        Name = "Create users in $department"
+                        Status = 'NeedsAttention'
+                        Details = "Target OU '$targetOu' is not present yet and is pending creation; its permissions will be checked after provisioning."
+                    })
+                if ($State.CreateDepartmentAdministrators) {
+                    $checks.Add([pscustomobject]@{
+                            Name = "Grant delegation on $department"
+                            Status = 'NeedsAttention'
+                            Details = "Target OU '$targetOu' is not present yet and is pending creation; delegation permissions will be checked after provisioning."
+                        })
+                }
+                continue
+            }
             $matchingRules = @($acl.Access | Where-Object {
                     try {
                         $ruleSid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
@@ -1086,8 +1100,6 @@ function Set-DepartmentDelegation {
         [string]$DomainNetBIOSName = ''
     )
 
-    $ouPath = Get-ADProviderPath -DistinguishedName $TargetOuDistinguishedName -Server $State.Server
-
     $userClassGuid = [System.Guid]'bf967aba-0de6-11d0-a285-00aa003049e2'
     $managedAccessRights = [System.DirectoryServices.ActiveDirectoryRights]::CreateChild -bor
         [System.DirectoryServices.ActiveDirectoryRights]::DeleteChild -bor
@@ -1106,7 +1118,8 @@ function Set-DepartmentDelegation {
 
     $groupSid = Get-ADValidatedSecurityGroupSid -Group $Group -ExpectedName $GroupName -ExpectedParentDistinguishedName $ExpectedGroupParentDistinguishedName
     # -LiteralPath: DNs can contain characters that are wildcards to -Path.
-    $acl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+    $acl = Invoke-ADObjectAcl -Action Read -DistinguishedName $TargetOuDistinguishedName `
+        -ADContext $State.ADContext
     $alreadyGranted = Test-ADUserLifecycleDelegation -AccessRules @($acl.Access) -GroupSid $groupSid
     Assert-ADUserLifecycleDelegationSafe -GroupSid $groupSid -CreatedByThisRun $CreatedByThisRun -ExistingDelegation $alreadyGranted
 
@@ -1146,12 +1159,14 @@ function Set-DepartmentDelegation {
         $userClassGuid
     )
     $acl.AddAccessRule($descendantAccessRule)
-    Set-Acl -LiteralPath $ouPath -AclObject $acl -ErrorAction Stop
+    Invoke-ADObjectAcl -Action Write -DistinguishedName $TargetOuDistinguishedName `
+        -ADContext $State.ADContext -AclObject $acl
 
-    # Verify the grant actually landed instead of trusting that Set-Acl did not throw.
-    $verifiedAcl = Get-Acl -LiteralPath $ouPath -ErrorAction Stop
+    # Verify the grant landed instead of trusting the directory write response.
+    $verifiedAcl = Invoke-ADObjectAcl -Action Read -DistinguishedName $TargetOuDistinguishedName `
+        -ADContext $State.ADContext
     if (-not (Test-ADUserLifecycleDelegation -AccessRules @($verifiedAcl.Access) -GroupSid $groupSid)) {
-        throw "Delegation for group '$GroupName' on '$TargetOuDistinguishedName' could not be verified after Set-Acl."
+        throw "Delegation for group '$GroupName' on '$TargetOuDistinguishedName' could not be verified after the directory ACL write."
     }
 
     return [pscustomobject]@{ GroupName = $GroupName; TargetOuDistinguishedName = $TargetOuDistinguishedName; Status = 'Granted' }

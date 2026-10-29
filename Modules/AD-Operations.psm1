@@ -56,6 +56,8 @@ function Assert-ADOperationsDependencies {
         'Get-ADToolContextParameters',
         'Clear-ADToolContext',
         'Get-ADProviderPath',
+        'Invoke-ADObjectAcl',
+        'ConvertTo-ADSIPathDistinguishedName',
         'Get-ADDistinguishedNameDepth',
         'Add-ADPreflightCheck',
         'Move-ADSecuredFileIntoPlace',
@@ -251,6 +253,103 @@ function Get-ADProviderPath {
     # AD provider paths use backtick escaping for path separators; preserve DN escaping.
     $providerSafeDistinguishedName = $DistinguishedName.Replace('`', '``').Replace('/', '`/')
     return "AD:\$providerSafeDistinguishedName"
+}
+
+function ConvertTo-ADSIPathDistinguishedName {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DistinguishedName)
+
+    $builder = [System.Text.StringBuilder]::new()
+    $escaped = $false
+    foreach ($character in $DistinguishedName.ToCharArray()) {
+        if ($character -eq '/' -and -not $escaped) {
+            [void]$builder.Append('\')
+        }
+        [void]$builder.Append($character)
+        if ($escaped) { $escaped = $false }
+        elseif ($character -eq '\') { $escaped = $true }
+    }
+    return $builder.ToString()
+}
+
+function Invoke-ADObjectAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Read', 'Write')][string]$Action,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DistinguishedName,
+        [Parameter(Mandatory)][hashtable]$ADContext,
+        [System.DirectoryServices.ActiveDirectorySecurity]$AclObject,
+        [switch]$AllowMissing
+    )
+
+    $server = [string]$ADContext.Server
+    if ([string]::IsNullOrWhiteSpace($server)) {
+        throw 'AD object ACL access requires an explicitly pinned server.'
+    }
+    if ($Action -eq 'Write' -and $null -eq $AclObject) {
+        throw 'An ActiveDirectorySecurity object is required for an ACL write.'
+    }
+
+    $lookupParameters = @{
+        Identity = $DistinguishedName
+        Server = $server
+        ErrorAction = 'Stop'
+    }
+    if ($ADContext.ContainsKey('Credential')) {
+        $lookupParameters.Credential = $ADContext['Credential']
+    }
+
+    $resolvedObjects = @()
+    try {
+        $resolvedObjects = @(Get-ADObject @lookupParameters)
+    }
+    catch {
+        if (Test-ADIdentityNotFoundError -ErrorRecord $_) {
+            if ($AllowMissing) { return $null }
+            throw "AD object '$DistinguishedName' does not exist on pinned server '$server'."
+        }
+        throw
+    }
+    if ($resolvedObjects.Count -eq 0) {
+        if ($AllowMissing) { return $null }
+        throw "AD object '$DistinguishedName' does not exist on pinned server '$server'."
+    }
+    if ($resolvedObjects.Count -ne 1) {
+        throw "AD object identity '$DistinguishedName' did not resolve uniquely on pinned server '$server'."
+    }
+    $resolvedObject = $resolvedObjects[0]
+    if (-not $resolvedObject.PSObject.Properties['DistinguishedName'] -or
+        (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName ([string]$resolvedObject.DistinguishedName)) -ne
+        (ConvertTo-ADCanonicalDistinguishedName -DistinguishedName $DistinguishedName)) {
+        throw "AD object identity '$DistinguishedName' did not resolve exactly on pinned server '$server'."
+    }
+
+    $ldapPath = "LDAP://$server/$(ConvertTo-ADSIPathDistinguishedName -DistinguishedName $DistinguishedName)"
+    $credential = if ($ADContext.ContainsKey('Credential')) { $ADContext['Credential'] } else { $null }
+    if ($credential) {
+        $networkCredential = $credential.GetNetworkCredential()
+        $entry = [System.DirectoryServices.DirectoryEntry]::new(
+            $ldapPath,
+            $credential.UserName,
+            $networkCredential.Password,
+            [System.DirectoryServices.AuthenticationTypes]::Secure
+        )
+    }
+    else {
+        $entry = [System.DirectoryServices.DirectoryEntry]::new($ldapPath)
+    }
+
+    try {
+        if ($Action -eq 'Read') {
+            return $entry.ObjectSecurity
+        }
+
+        $entry.ObjectSecurity = $AclObject
+        $entry.CommitChanges()
+    }
+    finally {
+        $entry.Dispose()
+    }
 }
 
 function Move-ADSecuredFileIntoPlace {
@@ -852,4 +951,4 @@ function Export-ADResults {
     Write-Host "Results exported to $resolvedPath" -ForegroundColor Green
 }
 
-Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Get-ADProviderPath,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,Add-ADPreflightCheck,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults
+Export-ModuleMember -Function Import-ADTools,Test-ADDomainReachability,Assert-ADOperationsDependencies,Set-ADToolContext,Get-ADToolContextParameters,Clear-ADToolContext,Get-ADProviderPath,ConvertTo-ADSIPathDistinguishedName,Invoke-ADObjectAcl,Move-ADSecuredFileIntoPlace,ConvertTo-LdapFilterValue,ConvertTo-DistinguishedNameValue,Split-ADDistinguishedName,Get-ADDistinguishedNameDepth,Add-ADPreflightCheck,ConvertTo-ADCanonicalDistinguishedName,Get-ADDistinguishedNameParent,Test-ADIdentityNotFoundError,Test-ADAccountInactive,New-ADTerminationDescription,Get-ADValidatedSecurityGroupSid,Test-ADUserLifecycleDelegation,Assert-ADUserLifecycleDelegationSafe,Assert-CsvColumns,ConvertTo-CsvBoolean,Resolve-ADIdentitySafe,Test-ADUserExists,Get-TargetOU,Write-ADAuditRecord,Assert-ADTargetWithinRoot,Export-ADResults

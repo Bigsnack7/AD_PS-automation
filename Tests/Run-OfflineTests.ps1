@@ -85,6 +85,21 @@ Assert-True ((Get-ADDistinguishedNameParent 'CN=O\,Brien,OU=Users,DC=example,DC=
 Assert-Throws { Get-ADDistinguishedNameParent 'OU=Users' } 'DN parent extraction rejects a DN without a parent'
 Assert-Throws { Get-ADProviderPath -DistinguishedName 'OU=Users,DC=example,DC=com' -Server 'dc.example.com' } `
     'AD ACL paths require a tool-owned AD drive pinned by an active context'
+Assert-True ((ConvertTo-ADSIPathDistinguishedName 'OU=R/D,OU=Smith\, Jr,DC=example,DC=com') -ceq `
+    'OU=R\/D,OU=Smith\, Jr,DC=example,DC=com') `
+    'ADSI LDAP paths escape path separators without altering DN escapes'
+Assert-True ((ConvertTo-ADSIPathDistinguishedName 'OU=R\/D,OU=Smith\, Jr,DC=example,DC=com') -ceq `
+    'OU=R\/D,OU=Smith\, Jr,DC=example,DC=com') `
+    'ADSI LDAP path conversion preserves an already escaped slash in a DN'
+$aclDiagnosticSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Tests\Diagnose-ADAcl.ps1'))
+Assert-True ($aclDiagnosticSource.Contains('$adDrive.Root') -and
+    $aclDiagnosticSource.Contains('$adDrive.Server') -and
+    $aclDiagnosticSource.Contains('$adDrive.Provider.Name') -and
+    $aclDiagnosticSource.Contains('Test-Path -LiteralPath $providerPath') -and
+    $aclDiagnosticSource.Contains('Get-ADOrganizationalUnit @lookupParameters') -and
+    $aclDiagnosticSource.Contains('Invoke-ADObjectAcl -Action Read') -and
+    -not $aclDiagnosticSource.Contains('[System.DirectoryServices.DirectoryEntry]::new')) `
+    'AD ACL diagnostic reports drive metadata, OU existence, provider path, and uses the shared ADSI ACL reader'
 $operationsSource = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Modules\AD-Operations.psm1'))
 $operationsTokens = $null
 $operationsParseErrors = $null
@@ -101,6 +116,20 @@ Assert-True (@($operationsParseErrors).Count -eq 0 -and
     $providerPathSource.Contains('Replace(''`'', ''``'').Replace(''/'', ''`/'')') -and
     $providerPathSource.Contains('return "AD:\$providerSafeDistinguishedName"')) `
     'AD ACL path builder uses AD:\ DN paths and escapes provider path separators'
+$aclHelperAst = $operationsAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-ADObjectAcl'
+}, $true)
+$aclHelperSource = if ($aclHelperAst) { $aclHelperAst.Extent.Text } else { '' }
+$aclExistenceCheckIndex = $aclHelperSource.IndexOf('Get-ADObject @lookupParameters', [System.StringComparison]::Ordinal)
+$aclBindIndex = $aclHelperSource.IndexOf('[System.DirectoryServices.DirectoryEntry]::new', [System.StringComparison]::Ordinal)
+Assert-True ($aclHelperAst -and $aclExistenceCheckIndex -ge 0 -and $aclBindIndex -gt $aclExistenceCheckIndex -and
+    $aclHelperSource.Contains('$entry.ObjectSecurity') -and $aclHelperSource.Contains('$entry.CommitChanges()') -and
+    $aclHelperSource.Contains('Server = $server') -and
+    $aclHelperSource.Contains('ConvertTo-ADCanonicalDistinguishedName') -and
+    $aclHelperSource.Contains('[switch]$AllowMissing')) `
+    'Shared AD ACL helper uniquely verifies the exact object on the pinned server before ADSI ACL reads or writes'
 $preflightChecks = [System.Collections.Generic.List[psobject]]::new()
 Add-ADPreflightCheck -Checks $preflightChecks -Name 'Offline check' -Status 'Passed' -Details 'Shared helper'
 Assert-True ($preflightChecks.Count -eq 1 -and $preflightChecks[0].Name -ceq 'Offline check' -and
@@ -141,10 +170,14 @@ $preflightFunctionAst = $preflightModuleAst.Find({
     $node.Name -eq 'Invoke-ADAutoXPreflight'
 }, $true)
 $preflightFunctionSource = if ($preflightFunctionAst) { $preflightFunctionAst.Extent.Text } else { '' }
-$preflightHasLiveChecks = @('Get-ADDomain', 'Get-ADOrganizationalUnit', 'Get-ADGroup', 'Get-Acl') |
+$preflightHasLiveChecks = @('Get-ADDomain', 'Get-ADOrganizationalUnit', 'Get-ADGroup', 'Invoke-ADObjectAcl') |
     Where-Object { $preflightFunctionSource.Contains($_) }
 Assert-True (@($preflightModuleParseErrors).Count -eq 0 -and @($preflightHasLiveChecks).Count -eq 4) `
     'Unified preflight contains the real AD domain, OU, group, and ACL checks'
+Assert-True ($preflightFunctionSource.Contains('-AllowMissing') -and
+    $preflightFunctionSource.Contains('$delegationStatus = ''NeedsAttention''') -and
+    $preflightFunctionSource.Contains('pending creation')) `
+    'Missing preflight ACL targets are reported as pending creation instead of throwing'
 
 $mark42Source = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'Cmdlets\mark42.ps1'))
 $mark42Tokens = $null
@@ -575,6 +608,8 @@ $resourceRollbackIsCentralized = $resourceRollbackSource.Contains('Invoke-ADAuto
     $resourceRollbackModuleSource.Contains("'ChildManagement'") -and
     $resourceRollbackModuleSource.Contains("'DescendantUserAccess'") -and
     $resourceRollbackModuleSource.Contains('DelegationRuleTypes') -and
+    $resourceRollbackModuleSource.Contains('Invoke-ADObjectAcl -Action Read') -and
+    $resourceRollbackModuleSource.Contains('Invoke-ADObjectAcl -Action Write') -and
     $resourceRollbackModuleSource.Contains('Get-ADGroupMember @adContext -Identity $item.DistinguishedName') -and
     $resourceRollbackModuleSource.Contains('$item.UndoData.GeneratedDescription') -and
     $resourceRollbackModuleSource.Contains('-SearchScope OneLevel -ResultSetSize 1') -and
@@ -584,6 +619,18 @@ $resourceRollbackIsCentralized = $resourceRollbackSource.Contains('Invoke-ADAuto
     -not $resourceRollbackSource.Contains('Remove-ADOrganizationalUnit')
 Assert-True $resourceRollbackIsCentralized `
     'Provisioning delegates resource rollback to the shared ledger while retaining group, delegation, and OU safeguards'
+$targetPermissionAst = $preflightProvisioningAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Test-ADProvisioningTargetPermissions'
+}, $true)
+$targetPermissionSource = if ($targetPermissionAst) { $targetPermissionAst.Extent.Text } else { '' }
+Assert-True ($targetPermissionSource.Contains('Invoke-ADObjectAcl -Action Read') -and
+    $targetPermissionSource.Contains('-AllowMissing') -and
+    $targetPermissionSource.Contains("Status = 'NeedsAttention'") -and
+    -not $targetPermissionSource.Contains('Get-Acl') -and
+    -not $targetPermissionSource.Contains('Set-Acl')) `
+    'Permission preflight reports absent target OUs as pending and uses the shared ACL reader'
 $runLevelCatch = $provisioningScriptAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.CatchClauseAst] -and
@@ -631,15 +678,29 @@ Assert-True ($ledgerAdapterSource.Contains('Add-ADAutoXLedgerEntry') -and
 $delegationGrant = $provisioningScriptAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Grant-DepartmentUserDelegation' }, $true)
 $delegationGrantSource = if ($delegationGrant) { $delegationGrant.Extent.Text } else { '' }
 $childRuleLedgerIndex = $delegationGrantSource.IndexOf('Add-ResourceLedgerEntry -Type ''Delegation'' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `', [System.StringComparison]::Ordinal)
-$applyDelegationAclIndex = $delegationGrantSource.IndexOf('Set-Acl -LiteralPath $ouPath -AclObject $acl', [System.StringComparison]::Ordinal)
+$applyDelegationAclIndex = $delegationGrantSource.IndexOf('Invoke-ADObjectAcl -Action Write', [System.StringComparison]::Ordinal)
 $delegationRollbackTracksOnlyAddedRules = $delegationGrantSource.Contains('$hasExactChildRule') -and
     $delegationGrantSource.Contains('$hasExactDescendantRule') -and
     $delegationGrantSource.Contains('$delegationRuleTypes.ToArray()') -and
+    $delegationGrantSource.Contains('Invoke-ADObjectAcl -Action Read') -and
+    -not $delegationGrantSource.Contains('Get-Acl') -and
+    -not $delegationGrantSource.Contains('Set-Acl') -and
     $childRuleLedgerIndex -ge 0 -and
     $applyDelegationAclIndex -ge 0 -and
     $childRuleLedgerIndex -lt $applyDelegationAclIndex
 Assert-True $delegationRollbackTracksOnlyAddedRules `
     'Delegation rollback records exact ACEs introduced by this run before applying ACL changes'
+$mark42DelegationGrant = $mark42Ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Grant-DepartmentUserDelegation'
+}, $true)
+$mark42DelegationSource = if ($mark42DelegationGrant) { $mark42DelegationGrant.Extent.Text } else { '' }
+Assert-True ($mark42DelegationSource.Contains('Invoke-ADObjectAcl -Action Read') -and
+    $mark42DelegationSource.Contains('Invoke-ADObjectAcl -Action Write') -and
+    -not $mark42DelegationSource.Contains('Get-Acl') -and
+    -not $mark42DelegationSource.Contains('Set-Acl')) `
+    'mark42 delegation uses only the shared AD object ACL helper'
 $sampleNames = @(Get-Content -LiteralPath (Join-Path $repoRoot 'Data\sample-names.txt') -ErrorAction Stop)
 $uniqueSampleNames = @($sampleNames | Sort-Object -Unique)
 Assert-True ($sampleNames.Count -eq 112 -and $uniqueSampleNames.Count -eq 112 -and

@@ -66,12 +66,14 @@ flowchart TD
 
 `Invoke-ADAutoXPreflight` is the one provisioning-preflight implementation; the older `Test-ADProvisioningPreflight` entry delegates to it. Lifecycle actions use their own target checks and protected-account guard, not the provisioning preflight.
 
+AD object ACL reads and writes resolve the exact distinguished name on the pinned domain controller before using the shared `DirectoryServices` LDAP helper; they do not depend on the `AD:` provider path. Planned OUs that are not present yet are reported as pending creation during preflight. To diagnose a DC-specific ACL issue, run `.\Tests\Diagnose-ADAcl.ps1` from the repository root, optionally specifying `-Server`, `-DistinguishedName`, and `-Credential`.
+
 ```text
 AD_PS-automation/
 ├── Cmdlets/   command scripts (mark42.ps1 is the canonical provisioner)
 ├── Modules/   ADAutoX.psd1 manifest and implementation modules
 ├── Data/      sample-names.txt
-├── Tests/     validate_repo.ps1, Run-OfflineTests.ps1
+├── Tests/     validate_repo.ps1, Run-OfflineTests.ps1, Diagnose-ADAcl.ps1
 └── README.md
 ```
 
