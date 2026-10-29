@@ -211,9 +211,15 @@ Current manual test evidence:
 - Mark 42 provisioning and termination have been exercised in a lab; the termination evidence includes a `-WhatIf` preview followed by an approved run.
 - Password reset, user move, and user enable have completed successfully against a real AD domain.
 - Disable and delete scripts have been exercised against real AD, but the supplied screenshots show their safety gates and `-WhatIf` previews, not completed live disable or deletion operations.
+- The security report has completed against a real AD domain; its screenshot is included as provided and shows the domain and privileged account names.
+- The audit report has produced a summary from the JSONL audit log; its screenshot is included as provided and shows a local account name and filesystem path.
+- `Script_Add_User_to_Group.ps1` has successfully added a user to a group in real AD; the screenshot shows the resulting membership and audit record.
+- `Reset-ADAutoXEnvironment.ps1` has completed its reset workflow in the shown AD environment; the screenshots show a `-WhatIf` preview and the completion message.
+- `Remove-Test-Users.ps1` has been exercised against real AD; the screenshots show its `-WhatIf` preview and cleanup completion output.
+- `New_User_Script.ps1` has been tested against real AD; the screenshot shows an existing-account rejection followed by successful creation of a different user.
 - Testing of other scripts is in progress. Manual tests do not imply that every parameter combination, AD topology, policy, or permission set has been tested.
 
-The screenshots below redact account and directory identifiers:
+Screenshots may contain account names, directory identifiers, or local filesystem paths. The reset and test-user cleanup workflows are destructive; review their scope and use `-WhatIf` before approving a run:
 
 ![Script_Terminate_User.ps1 preview and run](./docs/Script_Terminate_User.png)
 
@@ -226,6 +232,22 @@ The screenshots below redact account and directory identifiers:
 ![Script_Disable_User.ps1 guard and WhatIf preview](./docs/Script_Disable_User.png)
 
 ![Script_Delete_User.ps1 guard and WhatIf preview](./docs/Script_Delete_User.png)
+
+![Script_AD_Security_Report.ps1 completed against a real AD domain](./docs/Script_AD_Security_Report.png)
+
+![Script_AD_Audit_Report.ps1 audit summary](./docs/Script_AD_Audit_Report.png)
+
+![Script_Add_User_to_Group.ps1 successful real-AD group addition](./docs/Script_Add_User_to_Group.png)
+
+![Reset-ADAutoXEnvironment.ps1 reset preview](./docs/Reset-ADAutoXEnvironment-WhatIf.png)
+
+![Reset-ADAutoXEnvironment.ps1 completion](./docs/Reset-ADAutoXEnvironment-Completed.png)
+
+![Remove-Test-Users.ps1 cleanup preview](./docs/Remove-Test-Users-WhatIf.png)
+
+![Remove-Test-Users.ps1 cleanup completion](./docs/Remove-Test-Users-Completed.png)
+
+![New_User_Script.ps1 real-AD duplicate check and successful user creation](./docs/New_User_Script.png)
 
 ## Repository layout
 
