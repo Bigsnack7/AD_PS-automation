@@ -597,10 +597,11 @@ function Get-ADAutoXLockedOutUsers {
     try {
         $null = Set-ADToolContext -Server $Server -Credential $Credential
         $adContext = Get-ADToolContextParameters
-        $query = @{ Filter = 'LockedOut -eq $true'; Properties = 'LastLogonDate', 'Department', 'EmailAddress', 'DistinguishedName' }
+        $query = @{}
         if ($SearchBase) { $query.SearchBase = $SearchBase; $query.SearchScope = 'Subtree' }
         Write-ADAuditRecord -Path $AuditLogPath -Action 'FindLockedAccounts' -Target $target -Status 'Started' -Source 'ADAutoX' -CorrelationId $correlationId
-        $locked = @(Get-ADUser @adContext @query -ErrorAction Stop |
+        $locked = @(Search-ADAccount @adContext @query -LockedOut -UsersOnly -ErrorAction Stop |
+            Get-ADUser @adContext -Properties LastLogonDate, Department, EmailAddress, DistinguishedName -ErrorAction Stop |
             Select-Object Name, SamAccountName, UserPrincipalName, LastLogonDate, Department, EmailAddress, DistinguishedName)
         if ($CsvPath) { Export-ADResults -Results $locked -Path $CsvPath }
         Write-ADAuditRecord -Path $AuditLogPath -Action 'FindLockedAccounts' -Target $target -Status 'Succeeded' -Message "Found $($locked.Count) locked accounts." -Source 'ADAutoX' -CorrelationId $correlationId

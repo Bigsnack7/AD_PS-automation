@@ -43,6 +43,16 @@ function Assert-Throws {
 
 Write-Host 'Running AD_PS offline regression checks (no AD connection or Active Directory changes).' -ForegroundColor Cyan
 
+$lockedOutSourceFiles = @(
+    Get-ChildItem -LiteralPath (Join-Path $repoRoot 'Modules') -Filter '*.psm1' -File
+    Get-ChildItem -LiteralPath (Join-Path $repoRoot 'Cmdlets') -Filter '*.ps1' -File
+)
+$lockedOutFilterSources = @(
+    $lockedOutSourceFiles | Select-String -Pattern '(?i)\bFilter\s*(?:=|\s)\s*[''"]LockedOut\s+-eq\s+\$true[''"]'
+)
+Assert-True ($lockedOutFilterSources.Count -eq 0) `
+    'No module or command script uses a server-side LockedOut -eq $true filter'
+
 $singleProperty = switch ('Unlock') { 'Unlock' { @('LockedOut') } }
 $strictCountFailed = $false
 try {

@@ -104,7 +104,8 @@ function Get-ADAutoXSecurityScan {
         $query.SearchBase = $effectiveSearchBase
         $query.SearchScope = 'Subtree'
         $usersInScope = @(Get-ADUser @adContext @query -Filter * -Properties SamAccountName,Department,DistinguishedName,Enabled,LockedOut,PasswordNeverExpires,LastLogonDate,WhenChanged,WhenCreated -ErrorAction Stop)
-        $lockedUsers = @(Get-ADUser @adContext @query -Filter 'LockedOut -eq $true' -Properties LockedOut, AccountExpirationDate, LastLogonDate, Department -ErrorAction Stop)
+        $lockedUsers = @(Search-ADAccount @adContext @query -LockedOut -UsersOnly -ErrorAction Stop |
+            Get-ADUser @adContext -Properties LockedOut, AccountExpirationDate, LastLogonDate, Department -ErrorAction Stop)
         $neverExpires = @(Get-ADUser @adContext @query -Filter 'PasswordNeverExpires -eq $true' -Properties PasswordNeverExpires, Enabled, Department -ErrorAction Stop)
         $threshold = (Get-Date).AddDays(-$InactiveDays)
         $inactiveUsers = @(Get-ADUser @adContext @query -Filter 'Enabled -eq $true' -Properties LastLogonDate, WhenCreated, Department -ErrorAction Stop |

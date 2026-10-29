@@ -1,18 +1,16 @@
-# AD_PS-automation
+# AD_PS-automation: Technical and Operator Guide
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207+-5391D5?logo=powershell&logoColor=white)
 ![Active Directory](https://img.shields.io/badge/Active%20Directory-Automation-2DDE98?logo=microsoft&logoColor=white)
 ![Scope](https://img.shields.io/badge/Scope-Lab%20%2F%20Test-FF6B6B)
 
-AD_PS-automation is a PowerShell toolkit for safely provisioning department-based Active Directory OU structures, groups, users, and scoped delegation; performing supported user lifecycle actions; and producing security, audit, and user reports. A shared `ADAutoX` module centralizes the public API, provisioning preflight, lifecycle protections, verification, audit records, and rollback ledger, while command scripts provide canonical and compatibility entry points.
+This guide is the detailed operator and technical reference for AD_PS-automation. For a project overview and quick start, see [README.md](./README.md).
+
+AD_PS-automation is a PowerShell toolkit for provisioning department-based Active Directory OU structures, groups, users, and scoped delegation; performing supported user lifecycle actions; and producing security, audit, and user reports. A shared `ADAutoX` module centralizes the public API, provisioning preflight, lifecycle protections, verification, audit records, and rollback ledger, while command scripts provide canonical and compatibility entry points.
 
 > **Scope:** built for lab, test, and controlled administrative use. Anything beyond a lab should go through your organization's change control and security review.
 
-> **Testing status:** `mark42.ps1` and `Script_Terminate_User.ps1` have been tested successfully in the lab. The termination run included a `-WhatIf` preview followed by an approved run. Testing of the remaining scripts is in progress; the formal live-domain integration suite has not yet been verified.
-
-<!-- Add a terminal screenshot or short demo GIF here, for example:
-![Provisioning run](docs/demo.gif)
--->
+> **Testing status:** `mark42.ps1` and `Script_Terminate_User.ps1` have been tested successfully in the lab. `Script_Reset_User_Passwords.ps1`, `Script_Move_User.ps1`, and `Script_Enable_User.ps1` have completed successful operations against a real Active Directory domain. `Script_Disable_User.ps1` and `Script_Delete_User.ps1` have also been exercised against real AD; the supplied screenshots show their safety gates and `-WhatIf` previews, not completed live disable or deletion operations. The termination run included a `-WhatIf` preview followed by an approved run. Testing of the remaining scripts is in progress; the formal live-domain integration suite has not yet been verified.
 
 [Highlights](#highlights) · [Architecture](#architecture) · [Quick start](#quick-start) · [Provisioning](#how-a-provisioning-run-works) · [Lifecycle](#user-lifecycle) · [Safety features](#safety-features) · [Audit](#audit-logging) · [Testing](#testing) · [Reference](#reference)
 
@@ -76,8 +74,9 @@ AD_PS-automation/
 ├── Modules/   ADAutoX.psd1 manifest and implementation modules
 ├── Data/      sample-names.txt
 ├── Tests/     validate_repo.ps1, Run-OfflineTests.ps1, Diagnose-ADAcl.ps1
-├── README.md  short project overview
-└── PROJECT_GUIDE.md  detailed technical documentation
+├── docs/      project and manual-test screenshots
+├── README.md  project overview, setup, safety, and command index
+└── PROJECT_GUIDE.md  detailed operational and technical reference
 ```
 
 Run command scripts from the repository root using their `.\Cmdlets\...` paths.
@@ -130,16 +129,13 @@ Get-ADDomain
 .\Cmdlets\mark42.ps1 -AccountCount 5 -WhatIf
 
 # Preview an individual lifecycle action
-.\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -WhatIf
+.\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -AllowDestructiveOperation -WhatIf
 
 # Preview cleanup before deciding whether to apply it
 .\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
 
 # Read-only audit review
 .\Cmdlets\Script_AD_Audit_Report.ps1
-
-# Preview cleanup; do not apply until the target DN and plan have been reviewed
-.\Cmdlets\Remove-Test-Users.ps1 -OrganizationalUnitName 'Company' -WhatIf
 ```
 
 For any approved live change, rerun the reviewed command without `-WhatIf` and supply any required destructive-operation switch and exact target confirmation. A preview is not an offline simulation: read-only Active Directory queries can still run.
@@ -221,19 +217,22 @@ Lifecycle commands resolve an identity by SAM account name or distinguished name
 
 ```powershell
 # Preview an individual lifecycle action
-.\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -WhatIf
+.\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Disable -AllowDestructiveOperation -WhatIf
 
 # Preview a move and a termination
 .\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Move `
     -TargetOU 'OU=Users,OU=HR,OU=Staff,OU=Company,DC=example,DC=com' -WhatIf
 .\Cmdlets\Manage-ADAutoXUser.ps1 -Identity 'jdoe' -Action Terminate `
-    -Reason 'Employment ended' -TargetOU 'OU=Disabled,OU=Company,DC=example,DC=com' -WhatIf
+    -Reason 'Employment ended' -TargetOU 'OU=Disabled,OU=Company,DC=example,DC=com' `
+    -AllowDestructiveOperation -WhatIf
 
 # Find and clear locked accounts, scan for risky accounts
 .\Cmdlets\Script_Find_Locked-Out_Users.ps1 -CsvPath '.\reports\locked.csv'
 .\Cmdlets\Script_Unlock_User_Account.ps1 -Identity 'jdoe' -WhatIf
 .\Cmdlets\Get-ADAutoXSecurityScan.ps1 -InactiveDays 90
 ```
+
+Locked accounts are discovered with `Search-ADAccount -LockedOut -UsersOnly`; the user objects are then retrieved with `Get-ADUser` for the properties required by each report. `LockedOut` is computed by Active Directory and is not supported in a `Get-ADUser -Filter` expression.
 
 ### The ADAutoX module
 
@@ -315,7 +314,9 @@ Both report scripts share the same parser and filters; the legacy script keeps i
 
 ## Testing
 
-The Mark 42 provisioning script and `Script_Terminate_User.ps1` have been tested successfully in the lab. The termination run included a `-WhatIf` preview followed by an approved run, and the lifecycle ledger reported restoration entries for the account's enabled state and description. Testing of the remaining scripts is in progress. The offline checks below do not require an AD connection and do not make changes to Active Directory:
+The Mark 42 provisioning script and `Script_Terminate_User.ps1` have been tested successfully in the lab. `Script_Reset_User_Passwords.ps1`, `Script_Move_User.ps1`, and `Script_Enable_User.ps1` have completed successful operations against a real Active Directory domain in manual tests; the move and enable commands reported `Succeeded`. `Script_Disable_User.ps1` and `Script_Delete_User.ps1` have also been exercised against real AD; their screenshots show the destructive-operation guard and `-WhatIf` preview but do not show live disable or deletion completing. The termination run included a `-WhatIf` preview followed by an approved run, and the lifecycle ledger reported restoration entries for the account's enabled state and description. Testing of the remaining scripts is in progress. The offline checks below do not require an AD connection and do not make changes to Active Directory:
+
+See the redacted [test screenshots](./README.md#testing-and-verification).
 
 ```powershell
 .\Tests\validate_repo.ps1      # parse every .ps1 and .psm1; exits nonzero on parser errors
@@ -501,4 +502,4 @@ Outside `-WhatIf`, these scripts make real changes to Active Directory: creating
 4. Confirm the domain, OU path, and naming
 5. Follow change control for anything beyond a lab
 
-For a concise project overview, see [README.md](./README.md).
+For the project overview, setup instructions, and command index, see [README.md](./README.md).
