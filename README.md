@@ -19,7 +19,7 @@ I developed this PowerShell toolkit to make Active Directory administration more
 This project helps reduce time spent on manual AD tasks, standardizes onboarding across departments, and minimizes configuration drift, accidental changes, and operational risk. It is designed for controlled administrative use and is safer than ad hoc scripting in production-style environments.
 
 ## Testing status
-The Mark 42 provisioning script has been tested successfully in the lab. Testing of the remaining scripts is in progress.
+The Mark 42 provisioning script and `Script_Terminate_User.ps1` have been tested successfully in the lab. The termination run included a `-WhatIf` preview followed by an approved run; testing of the remaining scripts is in progress.
 
 ## Key components
 - `Cmdlets/mark42.ps1` — primary provisioning script

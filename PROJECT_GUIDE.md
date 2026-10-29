@@ -8,7 +8,7 @@ AD_PS-automation is a PowerShell toolkit for safely provisioning department-base
 
 > **Scope:** built for lab, test, and controlled administrative use. Anything beyond a lab should go through your organization's change control and security review.
 
-> **Testing status:** `mark42.ps1` has been tested successfully in the lab. Testing of the remaining scripts is in progress; live-domain integration testing has not yet been verified.
+> **Testing status:** `mark42.ps1` and `Script_Terminate_User.ps1` have been tested successfully in the lab. The termination run included a `-WhatIf` preview followed by an approved run. Testing of the remaining scripts is in progress; the formal live-domain integration suite has not yet been verified.
 
 <!-- Add a terminal screenshot or short demo GIF here, for example:
 ![Provisioning run](docs/demo.gif)
@@ -315,7 +315,7 @@ Both report scripts share the same parser and filters; the legacy script keeps i
 
 ## Testing
 
-The Mark 42 provisioning script has been tested successfully in the lab. Testing of the remaining scripts is in progress. The offline checks below do not require an AD connection and do not make changes to Active Directory:
+The Mark 42 provisioning script and `Script_Terminate_User.ps1` have been tested successfully in the lab. The termination run included a `-WhatIf` preview followed by an approved run, and the lifecycle ledger reported restoration entries for the account's enabled state and description. Testing of the remaining scripts is in progress. The offline checks below do not require an AD connection and do not make changes to Active Directory:
 
 ```powershell
 .\Tests\validate_repo.ps1      # parse every .ps1 and .psm1; exits nonzero on parser errors
@@ -330,7 +330,7 @@ Run the regression suite from the repository root in Windows PowerShell 5.1 or P
 powershell.exe -NoProfile -File .\Tests\Run-OfflineTests.ps1
 ```
 
-The offline suite exercises pure helpers and checks implementation wiring and safety contracts without connecting to AD or faking AD responses. The separate `Run-ADIntegrationTests.ps1` is opt-in and requires `-RunLive`; it is intended only for a disposable test domain. It has **not yet been verified in a live domain**. To attempt that integration test in an authorized test environment:
+The offline suite exercises pure helpers and checks implementation wiring and safety contracts without connecting to AD or faking AD responses. The separate `Run-ADIntegrationTests.ps1` is opt-in and requires `-RunLive`; it is intended only for a disposable test domain. The formal integration suite has **not yet been verified in a live domain**. To attempt that integration test in an authorized test environment:
 
 ```powershell
 .\Tests\Run-ADIntegrationTests.ps1 -RunLive -ExpectedDomainDnsRoot 'lab.example.test'
