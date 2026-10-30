@@ -130,6 +130,28 @@ $operationsParseErrors = $null
 $operationsAst = [System.Management.Automation.Language.Parser]::ParseInput(
     $operationsSource, [ref]$operationsTokens, [ref]$operationsParseErrors
 )
+$setContextFunction = $operationsAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Set-ADToolContext'
+}, $true)
+$setContextSource = if ($setContextFunction) { $setContextFunction.Extent.Text } else { '' }
+$importToolsIndex = $setContextSource.IndexOf('Import-ADTools', [System.StringComparison]::Ordinal)
+$driveLookupIndex = $setContextSource.IndexOf('$existingADDrive = Get-PSDrive', [System.StringComparison]::Ordinal)
+$providerLookupIndex = $setContextSource.IndexOf('Get-PSProvider -PSProvider ActiveDirectory', [System.StringComparison]::Ordinal)
+$driveParameterIndex = $setContextSource.IndexOf('$adDriveParameters = @{', [System.StringComparison]::Ordinal)
+$serverParameterIndex = $setContextSource.IndexOf(
+    'Server = $resolvedServer', $driveParameterIndex, [System.StringComparison]::Ordinal
+)
+Assert-True (@($operationsParseErrors).Count -eq 0 -and
+    $importToolsIndex -ge 0 -and $importToolsIndex -lt $driveLookupIndex -and
+    $providerLookupIndex -ge 0 -and $providerLookupIndex -lt $driveParameterIndex -and
+    $driveParameterIndex -ge 0 -and
+    $setContextSource.Substring($driveParameterIndex, $serverParameterIndex - $driveParameterIndex).Contains("PSProvider = `$activeDirectoryProvider.Name") -and
+    $setContextSource.Substring($driveParameterIndex, $serverParameterIndex - $driveParameterIndex).Contains("Root = '//RootDSE/'") -and
+    $setContextSource.Contains('if ($activeDirectoryProvider -and $activeDirectoryProvider.Name -eq ''ActiveDirectory'')') -and
+    $setContextSource.Contains('if ($existingADDrive -and $script:CreatedADToolDrive)')) `
+    'AD context imports the module first, scopes drive parameters to its provider, and tolerates an existing drive or missing provider'
 $providerPathFunction = $operationsAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and

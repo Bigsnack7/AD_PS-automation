@@ -114,11 +114,9 @@ function Set-ADToolContext {
         [System.Management.Automation.PSCredential]$Credential
     )
 
-    $isOutermost = ($script:ADToolContextStack.Count -eq 0)
+    Import-ADTools
+
     $existingADDrive = Get-PSDrive -Name AD -ErrorAction SilentlyContinue
-    if ($isOutermost -and $existingADDrive -and -not $script:CreatedADToolDrive) {
-        throw "A pre-existing AD: drive was found. Its target server cannot be verified safely; remove it or use a clean PowerShell session before starting AD automation."
-    }
 
     $snapshot = Get-ADToolDefaultSnapshot
 
@@ -142,11 +140,10 @@ function Set-ADToolContext {
             $resolvedServer = [string]$resolvedController.HostName
         }
 
-        if ($existingADDrive) {
+        if ($existingADDrive -and $script:CreatedADToolDrive) {
             $driveServer = ([string]$script:ADToolDriveServer).Trim().TrimEnd([char]'.')
             $requestedServer = $resolvedServer.Trim().TrimEnd([char]'.')
-            if (-not $script:CreatedADToolDrive -or
-                $existingADDrive.Provider.Name -ne 'ActiveDirectory' -or
+            if ($existingADDrive.Provider.Name -ne 'ActiveDirectory' -or
                 [string]::IsNullOrWhiteSpace($driveServer) -or
                 -not [string]::Equals($driveServer, $requestedServer, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw "The active AD: drive is not verified for requested server '$resolvedServer'. Clear the current AD context and start a clean session before continuing."
@@ -157,19 +154,22 @@ function Set-ADToolContext {
         }
 
         $global:PSDefaultParameterValues['*-AD*:Server'] = $resolvedServer
-        if (-not (Get-PSDrive -Name AD -ErrorAction SilentlyContinue)) {
-            $adDriveParameters = @{
-                Name = 'AD'
-                PSProvider = 'ActiveDirectory'
-                Root = '//RootDSE/'
-                Server = $resolvedServer
-                Scope = 'Global'
+        if (-not $existingADDrive) {
+            $activeDirectoryProvider = Get-PSProvider -PSProvider ActiveDirectory -ErrorAction SilentlyContinue
+            if ($activeDirectoryProvider -and $activeDirectoryProvider.Name -eq 'ActiveDirectory') {
+                $adDriveParameters = @{
+                    Name = 'AD'
+                    PSProvider = $activeDirectoryProvider.Name
+                    Root = '//RootDSE/'
+                    Scope = 'Global'
+                    Server = $resolvedServer
+                }
+                if ($effectiveCredential) { $adDriveParameters.Credential = $effectiveCredential }
+                $null = New-PSDrive @adDriveParameters -ErrorAction Stop
+                $script:CreatedADToolDrive = $true
+                $script:ADToolDriveServer = $resolvedServer
+                $createdDriveHere = $true
             }
-            if ($effectiveCredential) { $adDriveParameters.Credential = $effectiveCredential }
-            $null = New-PSDrive @adDriveParameters -ErrorAction Stop
-            $script:CreatedADToolDrive = $true
-            $script:ADToolDriveServer = $resolvedServer
-            $createdDriveHere = $true
         }
 
         # Only a fully successful call is recorded, so a failed call can never be "cleared".
