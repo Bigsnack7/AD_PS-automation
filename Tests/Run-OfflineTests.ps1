@@ -529,16 +529,28 @@ Assert-True ($lifecycleLedgerEntries.Count -eq 2 -and $lifecycleLedgerEntries[0]
 Initialize-ADAutoXLedger
 
 $autoXModule = Get-Module -Name ADAutoX -ErrorAction Stop
+$null = $autoXModule.SessionState.PSVariable.Remove('ADAutoXLedger')
 $null = $autoXModule.SessionState.PSVariable.Remove('ADAutoXLedgerSequence')
+$emptyMissingLedger = @(Get-ADAutoXLedger).Count -eq 0
+$getRecoveredLedgerState = $null -ne $autoXModule.SessionState.PSVariable.Get('ADAutoXLedger') -and
+    $null -ne $autoXModule.SessionState.PSVariable.Get('ADAutoXLedgerSequence')
+Assert-True ($emptyMissingLedger -and $getRecoveredLedgerState) `
+    'Shared ledger reader initializes an empty ledger and sequence when both variables are missing'
+
+$null = $autoXModule.SessionState.PSVariable.Remove('ADAutoXLedger')
+$null = $autoXModule.SessionState.PSVariable.Remove('ADAutoXLedgerSequence')
+$ledgerVariableRemoved = $autoXModule.SessionState.PSVariable.Get('ADAutoXLedger') -eq $null
+$sequenceVariableRemoved = $autoXModule.SessionState.PSVariable.Get('ADAutoXLedgerSequence') -eq $null
 $noOpLedgerRunId = [Guid]::NewGuid().ToString()
 $recoveredLedgerEntry = Add-ADAutoXLedgerEntry -ObjectType OU `
     -DistinguishedName 'OU=Existing,DC=example,DC=com' -Name 'Existing' `
     -RunId $noOpLedgerRunId -CreatedByThisRun $false
-$sequenceRecoveryValid = $recoveredLedgerEntry.Sequence -eq 1 -and
+$sequenceRecoveryValid = $ledgerVariableRemoved -and $sequenceVariableRemoved -and
+    $recoveredLedgerEntry.Sequence -eq 1 -and
     -not $recoveredLedgerEntry.CreatedByThisRun -and
     @((Get-ADAutoXLedger) | Where-Object RunId -eq $noOpLedgerRunId).Count -eq 1
 Assert-True $sequenceRecoveryValid `
-    'Shared ledger writer recovers an unset sequence and preserves pre-existing resources as non-rollback entries'
+    'Shared ledger writer recovers missing ledger and sequence variables and preserves pre-existing resources as non-rollback entries'
 Initialize-ADAutoXLedger
 
 $contractRunId = [Guid]::NewGuid().ToString()

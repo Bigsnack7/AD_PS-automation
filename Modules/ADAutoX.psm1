@@ -318,11 +318,6 @@ function Invoke-ADAutoXProvision {
     & $canonicalScript @arguments
 }
 
-$script:ADAutoXLedger = [System.Collections.Generic.List[psobject]]::new()
-if (-not (Test-Path variable:script:ADAutoXLedgerSequence)) {
-    $script:ADAutoXLedgerSequence = 0
-}
-
 function Test-ADAutoXDomainReachability {
     [CmdletBinding()]
     param([string]$Server, [PSCredential]$Credential)
@@ -386,9 +381,19 @@ function Write-ADAutoXConsole {
     }
 }
 
+function Initialize-ADAutoXLedgerState {
+    if (-not (Test-Path variable:script:ADAutoXLedger) -or $null -eq $script:ADAutoXLedger) {
+        $script:ADAutoXLedger = [System.Collections.Generic.List[psobject]]::new()
+    }
+    if (-not (Test-Path variable:script:ADAutoXLedgerSequence) -or $null -eq $script:ADAutoXLedgerSequence) {
+        $script:ADAutoXLedgerSequence = 0
+    }
+}
+
 function Initialize-ADAutoXLedger {
     [CmdletBinding()]
     param()
+    Initialize-ADAutoXLedgerState
     $script:ADAutoXLedger.Clear()
     $script:ADAutoXLedgerSequence = 0
 }
@@ -396,6 +401,7 @@ function Initialize-ADAutoXLedger {
 function Get-ADAutoXLedger {
     [CmdletBinding()]
     param()
+    Initialize-ADAutoXLedgerState
     $script:ADAutoXLedger.ToArray()
 }
 
@@ -414,6 +420,8 @@ function Add-ADAutoXLedgerEntry {
         [string]$RunId = '',
         [bool]$CreatedByThisRun = $true
     )
+    Initialize-ADAutoXLedgerState
+
     if ($ObjectType -eq 'Lifecycle') {
         if (-not $Action -or -not $UndoData -or -not $UndoData.UserIdentity) {
             throw 'Lifecycle ledger entries require an undo action and a user object identity.'
@@ -435,9 +443,6 @@ function Add-ADAutoXLedgerEntry {
     }
     if (-not $Name) {
         $Name = if ($SamAccountName) { $SamAccountName } else { $DistinguishedName }
-    }
-    if (-not (Test-Path variable:script:ADAutoXLedgerSequence)) {
-        $script:ADAutoXLedgerSequence = 0
     }
     $script:ADAutoXLedgerSequence++
     $entry = [pscustomobject]@{
@@ -604,6 +609,7 @@ function Invoke-ADAutoXLedgerRollback {
     if (-not $WhatIfPreference -and -not $AllowDestructiveOperation) {
         throw 'Live rollback requires -AllowDestructiveOperation. Preview with -WhatIf first.'
     }
+    Initialize-ADAutoXLedgerState
     $lifecycleItems = if ([string]::IsNullOrWhiteSpace($RunId)) {
         @($script:ADAutoXLedger | Where-Object ObjectType -eq 'Lifecycle' | Sort-Object Sequence -Descending)
     }
