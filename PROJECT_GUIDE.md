@@ -2,7 +2,7 @@
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207+-5391D5?logo=powershell&logoColor=white)
 ![Active Directory](https://img.shields.io/badge/Active%20Directory-Automation-2DDE98?logo=microsoft&logoColor=white)
-![Scope](https://img.shields.io/badge/Scope-Lab%20%2F%20Test-FF6B6B)
+![Scope](https://img.shields.io/badge/Scope-Disposable%20Lab%20Domain-FF6B6B)
 
 This guide is the detailed operator and technical reference for AD_PS-automation. For a project overview and quick start, see [README.md](./README.md).
 
@@ -10,9 +10,7 @@ AD_PS-automation is a PowerShell toolkit for provisioning department-based Activ
 
 Not every command script imports `ADAutoX.psd1` directly: module-backed commands do, compatibility wrappers locate and invoke their canonical target, and the cleanup implementation uses the shared `AD-Operations.psm1` module.
 
-> **Scope:** built for lab, test, and controlled administrative use. Anything beyond a lab should go through your organization's change control and security review.
-
-> **Testing status:** See the manual-evidence table under [Testing](#testing) for the same per-script status used in the README. Screenshot-based claims are operator-confirmed; image contents have not been independently reviewed here. The formal live-domain integration suite has not yet been verified.
+> **Scope:** built for a disposable lab domain and controlled administrative use. Anything beyond that scope should go through your organization's change control and security review.
 
 [Highlights](#highlights) · [Architecture](#architecture) · [Quick start](#quick-start) · [Provisioning](#how-a-provisioning-run-works) · [Lifecycle](#user-lifecycle) · [Safety features](#safety-features) · [Audit](#audit-logging) · [Testing](#testing) · [Reference](#reference)
 
@@ -89,7 +87,7 @@ Run command scripts from the repository root using their `.\Cmdlets\...` paths.
 
 ### Compatibility wrappers
 
-These legacy scripts preserve older command names or parameter interfaces and forward work to the listed canonical script or module function. They are adapters, not separate implementations of the forwarded operation. `ActiveDirectory-Provisioner.ps1` and `Generate-ADUsers.ps1` retain legacy provisioning defaults, so review their parameter descriptions before use.
+These legacy scripts preserve older command names or parameter interfaces and forward work to the listed canonical script or module function. They are adapters, not separate implementations of the forwarded operation. `mark42` is the canonical provisioner name; `Script_*` files are legacy-named entry points that forward operations to the `ADAutoX` module. `ActiveDirectory-Provisioner.ps1` and `Generate-ADUsers.ps1` retain legacy provisioning defaults, so review their parameter descriptions before use.
 
 | Legacy script | Forwards to |
 | --- | --- |
@@ -324,44 +322,30 @@ Both report scripts share the same parser and filters; the legacy script keeps i
 
 ## Testing
 
-The table below gives the same per-script manual-evidence status as the README. Screenshot-based claims are operator-confirmed; the screenshots themselves have not been independently reviewed here. A guard or `-WhatIf` preview does not establish that a live disable or deletion completed.
+The table below gives the same manual evidence summary as the README. A guard or `-WhatIf` preview does not establish that a live disable or deletion completed.
 
-| Command script | Manual evidence status |
+| Script with evidence | Manual evidence |
 | --- | --- |
-| `2_RESET_TEST_USERS.ps1` | Reached through `Remove-Test-Users.ps1`; the cleanup workflow has preview and completion screenshots. |
-| `ActiveDirectory-Provisioner.ps1` | Testing in progress; no manual result recorded. |
-| `ControlConsole.ps1` | Testing in progress; no manual result recorded. |
-| `Disable-ADAutoXInactiveUsers.ps1` | Testing in progress; no manual result recorded. |
-| `Export-Test-Users.ps1` | Testing in progress; no manual result recorded. |
-| `Generate-ADUsers.ps1` | Testing in progress; no manual result recorded. |
-| `Get-ADAutoXAuditReport.ps1` | Testing in progress; no manual result recorded. |
-| `Get-ADAutoXLockedOutUsers.ps1` | Testing in progress; no manual result recorded. |
-| `Get-ADAutoXSecurityScan.ps1` | Testing in progress; no manual result recorded. |
-| `Invoke-ADAutoXProvision.ps1` | Testing in progress; no manual result recorded. |
-| `Invoke-ADAutoXUserLifecycle.ps1` | Testing in progress; no manual result recorded. |
-| `Manage-ADAutoXUser.ps1` | Testing in progress; no manual result recorded. |
-| `mark42.ps1` | Manual provisioning run against real AD, confirmed by the operator; see `mark42-tested.png`. |
-| `New_User_Script.ps1` | Real-AD duplicate rejection followed by successful creation of another user; see `New_User_Script.png`. |
-| `Remove-Test-Users.ps1` | Real-AD workflow exercised; screenshots show a `-WhatIf` preview and completion output. |
-| `Reset-ADAutoXEnvironment.ps1` | Reset workflow preview and completion output confirmed; see its two screenshots. |
-| `Script_Add_User_to_Group.ps1` | Successful real-AD group addition confirmed; see `Script_Add_User_to_Group.png`. |
-| `Script_AD_Audit_Report.ps1` | Produced an audit summary from the JSONL log; see `Script_AD_Audit_Report.png`. |
-| `Script_AD_Security_Report.ps1` | Report completed against real AD; see `Script_AD_Security_Report.png`. |
-| `Script_Delete_User.ps1` | Guard and `-WhatIf` preview only; completed live deletion is not evidenced. |
-| `Script_Disable_Inactive_Users.ps1` | Testing in progress; no manual result recorded. |
-| `Script_Disable_User.ps1` | Guard and `-WhatIf` preview only; completed live disable is not evidenced. |
-| `Script_Enable_User.ps1` | Successful operation against real AD; see `Script_Enable_User.png`. |
-| `Script_Find_Locked-Out_Users.ps1` | Testing in progress; no manual result recorded. |
-| `Script_Move_User.ps1` | Successful operation against real AD; see `Script_Move_User.png`. |
-| `Script_Remove_User_from_Group.ps1` | Testing in progress; no manual result recorded. |
-| `Script_Reset_User_Passwords.ps1` | Successful operation against real AD; see `Script_Reset_User_Passwords.png`. |
-| `Script_Terminate_User.ps1` | Real-AD run with a `-WhatIf` preview followed by approved execution; see `Script_Terminate_User.png`. |
-| `Script_Unlock_User_Account.ps1` | Testing in progress; no manual result recorded. |
-| `Update-ADAutoXUserDepartments.ps1` | Testing in progress; no manual result recorded. |
+| `2_RESET_TEST_USERS.ps1` | Cleanup implementation invoked through `Remove-Test-Users.ps1`; preview and completion evidence: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
+| `mark42.ps1` | Provisioning evidence: `mark42-tested.png`. |
+| `New_User_Script.ps1` | Duplicate rejection and user creation: `New_User_Script.png`. |
+| `Remove-Test-Users.ps1` | Cleanup preview and completion: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
+| `Reset-ADAutoXEnvironment.ps1` | Reset preview and completion: `Reset-ADAutoXEnvironment-WhatIf.png`, `Reset-ADAutoXEnvironment-Completed.png`. |
+| `Script_Add_User_to_Group.ps1` | Group addition: `Script_Add_User_to_Group.png`. |
+| `Script_AD_Audit_Report.ps1` | Audit summary: `Script_AD_Audit_Report.png`. |
+| `Script_AD_Security_Report.ps1` | Formatted security report: `Script_AD_Security_Report.png`. |
+| `Script_Delete_User.ps1` | Guard and `-WhatIf` evidence only: `Script_Delete_User.png`; no completed live deletion evidence. |
+| `Script_Disable_User.ps1` | Guard and `-WhatIf` evidence only: `Script_Disable_User.png`; no completed live disable evidence. |
+| `Script_Enable_User.ps1` | Enable operation: `Script_Enable_User.png`. |
+| `Script_Move_User.ps1` | Move operation: `Script_Move_User.png`. |
+| `Script_Reset_User_Passwords.ps1` | Password reset operation: `Script_Reset_User_Passwords.png`. |
+| `Script_Terminate_User.ps1` | Preview and approved execution: `Script_Terminate_User.png`. |
 
-Manual runs do not establish coverage of every parameter combination, AD topology, policy, or permission set. The offline checks below do not require an AD connection and do not make changes to Active Directory:
+Remaining scripts are untested.
 
-See the [test screenshots](./README.md#testing-and-verification). Review the images for account names, directory identifiers, or local paths before sharing.
+Manual runs do not establish coverage of every parameter combination, AD topology, policy, or permission set. The offline checks below do not require an AD connection and do not make changes to Active Directory. Tested in a disposable lab domain; screenshots are in the [README testing section](./README.md#testing-and-verification).
+
+See the screenshot gallery in the README testing section.
 
 ```powershell
 .\Tests\validate_repo.ps1      # parse every .ps1 and .psm1; exits nonzero on parser errors
@@ -376,7 +360,7 @@ Run the regression suite from the repository root in Windows PowerShell 5.1 or P
 powershell.exe -NoProfile -File .\Tests\Run-OfflineTests.ps1
 ```
 
-The offline suite exercises pure helpers and checks implementation wiring and safety contracts without connecting to AD or faking AD responses. The separate `Run-ADIntegrationTests.ps1` is opt-in and requires `-RunLive`; it is intended only for a disposable test domain. The formal integration suite has **not yet been verified in a live domain**. To attempt that integration test in an authorized test environment:
+The offline suite exercises pure helpers and checks implementation wiring and safety contracts without connecting to AD or faking AD responses. The separate `Run-ADIntegrationTests.ps1` is opt-in and requires `-RunLive`; it is intended only for a disposable lab domain. The formal integration suite has not been verified in a live domain. To attempt that integration test in an authorized disposable lab domain:
 
 ```powershell
 .\Tests\Run-ADIntegrationTests.ps1 -RunLive -ExpectedDomainDnsRoot 'lab.example.test'
@@ -386,7 +370,7 @@ It securely prompts for a temporary password, verifies that the connected domain
 
 The suite covers LDAP/DN escaping, identity and error classification, inactivity cutoffs, termination notes, safe file publishing, credential-export guards, wrapper forwarding and rollback, audit filtering and correlation IDs, lifecycle ledger behavior, provisioning and name handling, password generation and patterns, context cleanup, group validation, and delegated ACL scope.
 
-**Not covered:** AD provider behavior, Windows ACL enforcement, permissions, replication, domain policy, and live rollback. Verify those in an authorized lab with a writable DC and a dedicated test OU.
+**Not covered:** AD provider behavior, Windows ACL enforcement, permissions, replication, domain policy, and live rollback. Verify those in an authorized disposable lab domain with a writable DC and a dedicated test OU.
 
 ## Limitations
 
@@ -512,8 +496,8 @@ All of the `Script_*.ps1` files above live in [`Cmdlets/`](./Cmdlets).
 | --- | --- | --- |
 | `Script_Disable_Inactive_Users.ps1`, [`Disable-ADAutoXInactiveUsers.ps1`](./Cmdlets/Disable-ADAutoXInactiveUsers.ps1) | Disable one account or run the bulk inactivity workflow | `-InactiveDays` (default 90, 1–3650), `-SearchBase`, `-IncludeNeverLoggedOn`, `-CsvPath`; domain-wide scans need `-AllowDomainWide`; applying needs `-AllowDestructiveOperation`; optional `-AllowProtectedAccount` |
 | `Script_Find_Locked-Out_Users.ps1`, [`Get-ADAutoXLockedOutUsers.ps1`](./Cmdlets/Get-ADAutoXLockedOutUsers.ps1) | Find locked-out accounts | `-SearchBase`, `-CsvPath` |
-| [`Get-ADAutoXSecurityScan.ps1`](./Cmdlets/Get-ADAutoXSecurityScan.ps1) | Structured posture scan: locked-out, password-never-expires, inactive | `-SearchBase`, `-InactiveDays`. Read-only |
-| `Script_AD_Security_Report.ps1` | Human-readable security summary including privileged users and department administrator counts | `-SearchBase`, `-DomainName`, `-Departments`, `-OrganizationalUnitName`. Without `-SearchBase` it falls back to a domain-wide scan, so set a scope deliberately |
+| [`Get-ADAutoXSecurityScan.ps1`](./Cmdlets/Get-ADAutoXSecurityScan.ps1) | Structured posture scan: locked-out, password-never-expires, inactive. Without `-SearchBase`, it scans the domain. | `-SearchBase`, `-InactiveDays`. Read-only |
+| [`Script_AD_Security_Report.ps1`](./Cmdlets/Script_AD_Security_Report.ps1) | Prints formatted `ReportLines` from the structured scan, including privileged users and department administrator counts. | `-SearchBase`, `-DomainName`, `-Departments`, `-OrganizationalUnitName` (default `Company`). Without `-SearchBase`, it scans the root-level `Company` OU subtree, or the domain if no such OU exists; duplicate root-level `Company` OUs cause an error. |
 | [`Update-ADAutoXUserDepartments.ps1`](./Cmdlets/Update-ADAutoXUserDepartments.ps1) | Derive department attributes from the OU layout | Required `-SearchBase`; `-CompanyName` (default `Company`); supports `-WhatIf` |
 | `Script_AD_Audit_Report.ps1` | Read-only JSONL audit summary and timeline (no AD connection needed) | `-AuditLogPath`, `-Identity`, `-Action`, `-Status` (`Started`, `Succeeded`, `Failed`, `Skipped`, `Preview`, `CompletedWithErrors`), `-OutputPath`, `-AsJson` |
 | [`Get-ADAutoXAuditReport.ps1`](./Cmdlets/Get-ADAutoXAuditReport.ps1) | Module-based audit filter and CSV export | Adds `-Actor` to the filters above |
@@ -575,6 +559,8 @@ Outside `-WhatIf`, these scripts make real changes to Active Directory: creating
 2. Test on a small batch
 3. Review the audit log
 4. Confirm the domain, OU path, and naming
-5. Follow change control for anything beyond a lab
+5. Follow change control for anything beyond a disposable lab domain
 
 For the project overview, setup instructions, and command index, see [README.md](./README.md).
+
+Before pushing, blur domain names, privileged account names, and local paths in screenshots under `docs/`.

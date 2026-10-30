@@ -1,12 +1,18 @@
+AD_PS-automation automates repeatable Active Directory provisioning, user lifecycle operations, and security and audit reporting.<br>
+Stack: PowerShell, Active Directory, and JSONL audit logging.<br>
+SOC relevance: guarded changes, an audit trail, and security posture reports support accountable Blue Team operations.
+
 # AD_PS-automation
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207+-5391D5?logo=powershell&logoColor=white)
 ![Active Directory](https://img.shields.io/badge/Active%20Directory-Automation-2DDE98?logo=microsoft&logoColor=white)
-![Scope](https://img.shields.io/badge/Scope-Lab%20%2F%20Controlled%20Use-FF6B6B)
+![Scope](https://img.shields.io/badge/Scope-Disposable%20Lab%20Domain-FF6B6B)
 
-AD_PS-automation is a PowerShell toolkit for repeatable Active Directory provisioning, user lifecycle operations, security and audit reporting, and controlled lab cleanup. Its `ADAutoX` module provides the public API and shared context, validation, safety, verification, logging, and rollback services. Module-backed commands import it directly; compatibility wrappers forward to a canonical script or module function.
+AD_PS-automation is a PowerShell toolkit for repeatable Active Directory provisioning, user lifecycle operations, security and audit reporting, and controlled environment cleanup. Its `ADAutoX` module provides the public API and shared context, validation, safety, verification, logging, and rollback services. Module-backed commands import it directly; compatibility wrappers forward to a canonical script or module function.
 
-> **Scope:** Designed for lab, test, and carefully controlled administrative use. Production use requires your organization's security review, authorization, and change-control process.
+> **Scope:** Designed for a disposable lab domain and carefully controlled administrative use. Production use requires your organization's security review, authorization, and change-control process.
+
+![mark42 provisioning report from a disposable lab domain](./docs/mark42-tested.png)
 
 ## Contents
 
@@ -21,6 +27,7 @@ AD_PS-automation is a PowerShell toolkit for repeatable Active Directory provisi
 - [Testing and verification](#testing-and-verification)
 - [Repository layout](#repository-layout)
 - [Detailed technical guide](#detailed-technical-guide)
+- [Disclaimer](#disclaimer)
 
 ## Capabilities
 
@@ -36,7 +43,7 @@ AD_PS-automation is a PowerShell toolkit for repeatable Active Directory provisi
 - Windows PowerShell 5.1 or PowerShell 7 on Windows.
 - The Active Directory PowerShell module (RSAT) available to the selected PowerShell session.
 - Network access to an appropriate domain controller and an account with the rights needed for the requested operation.
-- For provisioning, use a dedicated test OU or disposable test domain until the exact plan and permissions have been reviewed.
+- For provisioning, use a disposable lab domain until the exact plan and permissions have been reviewed.
 
 From the repository root, confirm the Active Directory module and domain are available:
 
@@ -83,6 +90,8 @@ Review the command output, target distinguished name, audit record, and any gene
 
 [`mark42.ps1`](./Cmdlets/mark42.ps1) is the canonical bulk provisioner. By default, it requests 20 standard users, uses the departments IT, HR, Finance, and Sales, creates department administrator accounts, and builds this OU layout beneath the domain:
 
+The `mark42` name is the canonical provisioner; `Script_*` files are legacy-named entry points that forward operations to the `ADAutoX` module.
+
 ```text
 Company
 └── Staff
@@ -127,7 +136,7 @@ Use the named scripts for a single task or [`Manage-ADAutoXUser.ps1`](./Cmdlets/
 | Create and verify one account | `New_User_Script.ps1` |
 | Export users to CSV | `Export-Test-Users.ps1` |
 
-Locked-account discovery uses `Search-ADAccount -LockedOut -UsersOnly` and then retrieves the user properties required for the report. Security reporting supports an optional `-SearchBase`; when omitted it uses the configured company OU when found, otherwise the domain scope. Review the report command's help and parameters before using a broad search.
+Locked-account discovery uses `Search-ADAccount -LockedOut -UsersOnly` and then retrieves the user properties required for the report. `Script_AD_Security_Report.ps1` defaults `-OrganizationalUnitName` to `Company`: without `-SearchBase`, it searches for a root-level `Company` OU and scans its subtree; if none is found, it scans the domain. Multiple root-level `Company` OUs cause an error. `Get-ADAutoXSecurityScan.ps1` does not set that company-OU default, so omitting `-SearchBase` scans the domain. The script report prints formatted report lines from the structured scan result.
 
 ## Safety, audit, and rollback
 
@@ -183,7 +192,7 @@ Every script in `Cmdlets\` is indexed below. Run commands from the repository ro
 | [`Script_Find_Locked-Out_Users.ps1`](./Cmdlets/Script_Find_Locked-Out_Users.ps1) | Find and optionally export locked-out users. |
 | [`Get-ADAutoXLockedOutUsers.ps1`](./Cmdlets/Get-ADAutoXLockedOutUsers.ps1) | Module-backed locked-account query. |
 | [`Get-ADAutoXSecurityScan.ps1`](./Cmdlets/Get-ADAutoXSecurityScan.ps1) | Structured scan for locked-out, inactive, and password-never-expires accounts. |
-| [`Script_AD_Security_Report.ps1`](./Cmdlets/Script_AD_Security_Report.ps1) | Human-readable security report; set a deliberate search scope. |
+| [`Script_AD_Security_Report.ps1`](./Cmdlets/Script_AD_Security_Report.ps1) | Prints formatted report lines from the structured security scan; see the scope behavior above. |
 | [`Update-ADAutoXUserDepartments.ps1`](./Cmdlets/Update-ADAutoXUserDepartments.ps1) | Update department attributes from the configured OU layout. |
 | [`Script_AD_Audit_Report.ps1`](./Cmdlets/Script_AD_Audit_Report.ps1) | Read and filter JSONL audit records; does not require an AD connection. |
 | [`Get-ADAutoXAuditReport.ps1`](./Cmdlets/Get-ADAutoXAuditReport.ps1) | Module-backed audit filtering and report export. |
@@ -201,54 +210,40 @@ Compatibility wrappers can preserve older names, parameter shapes, or defaults. 
 | --- | --- | --- |
 | [`validate_repo.ps1`](./Tests/validate_repo.ps1) | Parse PowerShell source and fail on syntax errors. | No AD connection. |
 | [`Run-OfflineTests.ps1`](./Tests/Run-OfflineTests.ps1) | Check helper behavior, exports, wrapper wiring, audit/rollback contracts, and safety regressions. | No AD connection. |
-| [`Run-ADIntegrationTests.ps1`](./Tests/Run-ADIntegrationTests.ps1) | Opt-in integration test; requires `-RunLive`, the expected DNS root, and a disposable test domain; creates and rolls back uniquely named resources. | Makes live changes in the explicitly selected test domain. |
+| [`Run-ADIntegrationTests.ps1`](./Tests/Run-ADIntegrationTests.ps1) | Opt-in integration test; requires `-RunLive`, the expected DNS root, and a disposable lab domain; creates and rolls back uniquely named resources. | Makes live changes in the explicitly selected disposable lab domain. |
 | [`Diagnose-ADAcl.ps1`](./Tests/Diagnose-ADAcl.ps1) | Diagnose AD provider, domain-controller, OU lookup, and ACL-read behavior; accepts optional `-Server`, `-DistinguishedName`, and `-Credential`. | Performs AD reads; intended for troubleshooting. |
 
-The formal integration suite has not yet been verified in a live domain.
+The formal integration suite has not been verified in a live domain.
 
 Current manual test evidence:
 
-- The table records the manual evidence currently available for every command script. Screenshot-based claims are operator-confirmed; the image contents have not been independently reviewed here.
-- A `-WhatIf` preview or guard screenshot is not evidence that a live disable or deletion completed. The formal live-domain integration suite has not yet been verified.
+- The table lists scripts with available manual evidence. A `-WhatIf` preview or guard screenshot is not evidence that a live disable or deletion completed.
 
-| Command script | Manual evidence status |
+| Script with evidence | Manual evidence |
 | --- | --- |
-| `2_RESET_TEST_USERS.ps1` | Reached through `Remove-Test-Users.ps1`; the cleanup workflow has preview and completion screenshots. |
-| `ActiveDirectory-Provisioner.ps1` | Testing in progress; no manual result recorded. |
-| `ControlConsole.ps1` | Testing in progress; no manual result recorded. |
-| `Disable-ADAutoXInactiveUsers.ps1` | Testing in progress; no manual result recorded. |
-| `Export-Test-Users.ps1` | Testing in progress; no manual result recorded. |
-| `Generate-ADUsers.ps1` | Testing in progress; no manual result recorded. |
-| `Get-ADAutoXAuditReport.ps1` | Testing in progress; no manual result recorded. |
-| `Get-ADAutoXLockedOutUsers.ps1` | Testing in progress; no manual result recorded. |
-| `Get-ADAutoXSecurityScan.ps1` | Testing in progress; no manual result recorded. |
-| `Invoke-ADAutoXProvision.ps1` | Testing in progress; no manual result recorded. |
-| `Invoke-ADAutoXUserLifecycle.ps1` | Testing in progress; no manual result recorded. |
-| `Manage-ADAutoXUser.ps1` | Testing in progress; no manual result recorded. |
-| `mark42.ps1` | Manual provisioning run against real AD, confirmed by the operator; see `mark42-tested.png`. |
-| `New_User_Script.ps1` | Real-AD duplicate rejection followed by successful creation of another user; see `New_User_Script.png`. |
-| `Remove-Test-Users.ps1` | Real-AD workflow exercised; screenshots show a `-WhatIf` preview and completion output. |
-| `Reset-ADAutoXEnvironment.ps1` | Reset workflow preview and completion output confirmed; see its two screenshots. |
-| `Script_Add_User_to_Group.ps1` | Successful real-AD group addition confirmed; see `Script_Add_User_to_Group.png`. |
-| `Script_AD_Audit_Report.ps1` | Produced an audit summary from the JSONL log; see `Script_AD_Audit_Report.png`. |
-| `Script_AD_Security_Report.ps1` | Report completed against real AD; see `Script_AD_Security_Report.png`. |
-| `Script_Delete_User.ps1` | Guard and `-WhatIf` preview only; completed live deletion is not evidenced. |
-| `Script_Disable_Inactive_Users.ps1` | Testing in progress; no manual result recorded. |
-| `Script_Disable_User.ps1` | Guard and `-WhatIf` preview only; completed live disable is not evidenced. |
-| `Script_Enable_User.ps1` | Successful operation against real AD; see `Script_Enable_User.png`. |
-| `Script_Find_Locked-Out_Users.ps1` | Testing in progress; no manual result recorded. |
-| `Script_Move_User.ps1` | Successful operation against real AD; see `Script_Move_User.png`. |
-| `Script_Remove_User_from_Group.ps1` | Testing in progress; no manual result recorded. |
-| `Script_Reset_User_Passwords.ps1` | Successful operation against real AD; see `Script_Reset_User_Passwords.png`. |
-| `Script_Terminate_User.ps1` | Real-AD run with a `-WhatIf` preview followed by approved execution; see `Script_Terminate_User.png`. |
-| `Script_Unlock_User_Account.ps1` | Testing in progress; no manual result recorded. |
-| `Update-ADAutoXUserDepartments.ps1` | Testing in progress; no manual result recorded. |
+| `2_RESET_TEST_USERS.ps1` | Cleanup implementation invoked through `Remove-Test-Users.ps1`; preview and completion evidence: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
+| `mark42.ps1` | Provisioning evidence: `mark42-tested.png`. |
+| `New_User_Script.ps1` | Duplicate rejection and user creation: `New_User_Script.png`. |
+| `Remove-Test-Users.ps1` | Cleanup preview and completion: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
+| `Reset-ADAutoXEnvironment.ps1` | Reset preview and completion: `Reset-ADAutoXEnvironment-WhatIf.png`, `Reset-ADAutoXEnvironment-Completed.png`. |
+| `Script_Add_User_to_Group.ps1` | Group addition: `Script_Add_User_to_Group.png`. |
+| `Script_AD_Audit_Report.ps1` | Audit summary: `Script_AD_Audit_Report.png`. |
+| `Script_AD_Security_Report.ps1` | Formatted security report: `Script_AD_Security_Report.png`. |
+| `Script_Delete_User.ps1` | Guard and `-WhatIf` evidence only: `Script_Delete_User.png`; no completed live deletion evidence. |
+| `Script_Disable_User.ps1` | Guard and `-WhatIf` evidence only: `Script_Disable_User.png`; no completed live disable evidence. |
+| `Script_Enable_User.ps1` | Enable operation: `Script_Enable_User.png`. |
+| `Script_Move_User.ps1` | Move operation: `Script_Move_User.png`. |
+| `Script_Reset_User_Passwords.ps1` | Password reset operation: `Script_Reset_User_Passwords.png`. |
+| `Script_Terminate_User.ps1` | Preview and approved execution: `Script_Terminate_User.png`. |
 
-Manual runs do not establish coverage of every parameter combination, AD topology, policy, or permission set.
+Remaining scripts are untested.
 
-Screenshots are supplied as-is and may contain account names, directory identifiers, or local filesystem paths; review them before sharing. The reset and test-user cleanup workflows are destructive; review their scope and use `-WhatIf` before approving a run:
+Manual runs do not establish coverage of every parameter combination, AD topology, policy, or permission set. Tested in a disposable lab domain; screenshots below.
 
-![mark42.ps1 manual provisioning evidence](./docs/mark42-tested.png)
+The reset and test-user cleanup workflows are destructive; review their scope and use `-WhatIf` before approving a run.
+
+<details>
+<summary>More manual evidence screenshots</summary>
 
 ![Script_Terminate_User.ps1 preview and run](./docs/Script_Terminate_User.png)
 
@@ -262,11 +257,11 @@ Screenshots are supplied as-is and may contain account names, directory identifi
 
 ![Script_Delete_User.ps1 guard and WhatIf preview](./docs/Script_Delete_User.png)
 
-![Script_AD_Security_Report.ps1 completed against a real AD domain](./docs/Script_AD_Security_Report.png)
+![Script_AD_Security_Report.ps1 formatted security report](./docs/Script_AD_Security_Report.png)
 
 ![Script_AD_Audit_Report.ps1 audit summary](./docs/Script_AD_Audit_Report.png)
 
-![Script_Add_User_to_Group.ps1 successful real-AD group addition](./docs/Script_Add_User_to_Group.png)
+![Script_Add_User_to_Group.ps1 group addition](./docs/Script_Add_User_to_Group.png)
 
 ![Reset-ADAutoXEnvironment.ps1 reset preview](./docs/Reset-ADAutoXEnvironment-WhatIf.png)
 
@@ -276,7 +271,9 @@ Screenshots are supplied as-is and may contain account names, directory identifi
 
 ![Remove-Test-Users.ps1 cleanup completion](./docs/Remove-Test-Users-Completed.png)
 
-![New_User_Script.ps1 real-AD duplicate check and successful user creation](./docs/New_User_Script.png)
+![New_User_Script.ps1 duplicate check and user creation](./docs/New_User_Script.png)
+
+</details>
 
 ## Repository layout
 
@@ -293,7 +290,7 @@ AD_PS-automation/
 │                  Detailed operational and technical reference
 ```
 
-`AD-Operations.jsonl` may be generated locally by a run. It is ignored by `.gitignore` and is not committed.
+`AD-Operations.jsonl` may be generated locally by a run and is ignored by `.gitignore`.
 
 ## Detailed technical guide
 
@@ -301,4 +298,6 @@ AD_PS-automation/
 
 ## Disclaimer
 
-Outside preview mode, these scripts can make real directory changes, including creating accounts, changing passwords or group membership, disabling or deleting accounts, and removing lab resources. Use them only with explicit authorization. Review the target domain and distinguished name, preview first, test with a small scope, inspect reports and audit records, and follow formal change control for production environments.
+Outside preview mode, these scripts can make real directory changes, including creating accounts, changing passwords or group membership, disabling or deleting accounts, and removing directory resources. Use them only with explicit authorization. Review the target domain and distinguished name, preview first, test with a small scope, inspect reports and audit records, and follow formal change control for production environments.
+
+Before pushing, blur domain names, privileged account names, and local paths in screenshots under `docs/`.
