@@ -91,7 +91,7 @@ These legacy scripts preserve older command names or parameter interfaces and fo
 
 | Legacy script | Forwards to |
 | --- | --- |
-| [`ActiveDirectory-Provisioner.ps1`](./Cmdlets/ActiveDirectory-Provisioner.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1) |
+| [`ActiveDirectory-Provisioner.ps1`](./Cmdlets/ActiveDirectory-Provisioner.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1); requires `-Password` or `-PasswordPattern` for a live run |
 | [`Generate-ADUsers.ps1`](./Cmdlets/Generate-ADUsers.ps1) | Canonical [`mark42.ps1`](./Cmdlets/mark42.ps1), with legacy defaults |
 | [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | `Invoke-ADAutoXUserAction`; `-AllowProtectedAccount` is forwarded for guarded actions |
 | [`Remove-Test-Users.ps1`](./Cmdlets/Remove-Test-Users.ps1) | [`2_RESET_TEST_USERS.ps1`](./Cmdlets/2_RESET_TEST_USERS.ps1) |
@@ -217,6 +217,15 @@ $securePassword = Read-Host 'Shared lab password' -AsSecureString
 .\Cmdlets\mark42.ps1 -AccountCount 5 -ExportPasswords -PasswordFile '.\user-passwords.clixml' -WhatIf
 ```
 
+For the legacy wrapper, capture the password without displaying it or placing it in shell history. It accepts `-Password` as a `SecureString`; the same supplied value is used for each newly created account unless a password pattern is configured. Existing matching users are skipped and their passwords are not changed. Active Directory enforces the account's effective password policy. Direct `mark42.ps1` runs generate a separate random password per new account when no password source is supplied, unlike the legacy wrapper.
+
+```powershell
+$pw = Read-Host 'Initial lab password' -AsSecureString
+.\Cmdlets\ActiveDirectory-Provisioner.ps1 -Password $pw -WhatIf
+```
+
+Remove `-WhatIf` only after reviewing the target domain, preflight, and requested changes.
+
 ## User lifecycle
 
 Lifecycle commands resolve an identity by SAM account name or distinguished name, verify the outcome where supported, and restore shared AD context in `finally`. Disable, terminate, delete, and group-removal actions require `-AllowDestructiveOperation` on top of preview and confirmation.
@@ -326,8 +335,12 @@ The table below gives the same manual evidence summary as the README. A guard or
 
 | Script with evidence | Manual evidence |
 | --- | --- |
-| `2_RESET_TEST_USERS.ps1` | Cleanup implementation invoked through `Remove-Test-Users.ps1`; preview and completion evidence: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
+| `2_RESET_TEST_USERS.ps1` | Live AD query found the `Company` OU and enumerated 25 users, 13 child OUs, and 12 other objects. Both screenshots show a `-WhatIf` preview; they confirm AD connectivity and scope, not completed deletion: [`preview`](./docs/2_RESET_TEST_USERS-WhatIf.png), [`continued preview`](./docs/2_RESET_TEST_USERS-WhatIf-Completed.png). |
+| `ActiveDirectory-Provisioner.ps1` | Successful run against a live AD disposable lab domain: preflight passed 30 checks; the one missing account was created, 23 existing accounts were skipped, and 0 failed. Screenshots: [`preflight`](./docs/ActiveDirectory-Provisioner-Preflight.png), [`completed run`](./docs/ActiveDirectory-Provisioner-Completed.png). The supplied `-SecureString` password was used for the new account. |
+| `ControlConsole.ps1` | The [console screenshot](./docs/ControlConsole.png) shows the menu launching. No option is selected, so it does not demonstrate AD connectivity or a completed AD operation. |
+| `Invoke-ADAutoXUserLifecycle.ps1` | Successfully enabled an account in live AD. The [screenshot](./docs/Invoke-ADAutoXUserLifecycle-Enable.png) shows the target and `Succeeded` result. |
 | `mark42.ps1` | Provisioning evidence: `mark42-tested.png`. |
+| `Manage-ADAutoXUser.ps1` | Resolved the account in live AD and showed a `-WhatIf` disable preview after rejecting the first attempt for missing `-AllowDestructiveOperation`. The [screenshot](./docs/Manage-ADAutoXUser-WhatIf.png) confirms target lookup and preview, not a completed disable. |
 | `New_User_Script.ps1` | Duplicate rejection and user creation: `New_User_Script.png`. |
 | `Remove-Test-Users.ps1` | Cleanup preview and completion: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
 | `Reset-ADAutoXEnvironment.ps1` | Reset preview and completion: `Reset-ADAutoXEnvironment-WhatIf.png`, `Reset-ADAutoXEnvironment-Completed.png`. |
@@ -424,7 +437,7 @@ The default live run requests 20 standard users, creates department administrato
 | `-AdministratorsOnly` | Off | Provision only department administrator OUs, groups, and accounts; skips the names file. |
 | `-CreateDepartmentAdministrators` | On | Create an administrator account and groups per department. Pass `:$false` to opt out. |
 | `-AdministratorUsername` | `<department>.admin` | Administrator SAM-account-name template. Use `{0}` for the department name, e.g. `deptadmin-{0}`. Required when one custom base name spans several departments. |
-| `-Password` | Random per account | Optional `SecureString` shared by all accounts in the run. Takes precedence over patterns. |
+| `-Password` | None; direct `mark42.ps1` generates random per-account passwords when omitted | Optional `SecureString` shared by newly created accounts when no applicable password pattern is configured. The legacy `ActiveDirectory-Provisioner.ps1` wrapper requires `-Password` or `-PasswordPattern` for a live run. |
 | `-PasswordPattern` | None | Per-account pattern for standard users. `{0}` is the username; `{1}`/`{2}` are the one-based account token. Escape literal braces as `{{` and `}}`. Preflight checks are best-effort; AD enforces the real policy at creation. |
 | `-AdministratorPasswordPattern` | None | Pattern for department administrators. `{0}` is the administrator username (and `{1}`/`{2}` resolve to it too). |
 | `-EnableAccountsAfterVerification` | Off | Create accounts disabled, verify attributes and memberships, then enable and re-verify. |
@@ -442,7 +455,7 @@ The default live run requests 20 standard users, creates department administrato
 | `-IncludePasswordInReport` | Off | Add **plaintext** passwords to the CSV. See [Safety features](#safety-features). |
 | `-WhatIf` / `-Confirm` / `-Verbose` | | Standard PowerShell preview, confirmation, and diagnostic output. |
 
-Two hidden compatibility parameters, `-TreatZeroAccountCountAsNone` and `-DisableDepartmentAdministratorsByDefault`, exist for the wrapper scripts and are not meant for direct use. `-RollbackOnFailure` and `-RollbackAccountsOnFailure` are aliases of `-RollbackCreatedAccountsOnFailure` on `mark42.ps1`; `Invoke-ADAutoXProvision.ps1` has a separate `-RollbackOnFailure` switch. Notably, `-AccountCount 0` on `mark42.ps1` means "all valid names", while the `Generate-ADUsers.ps1` wrapper keeps its older meaning of "no standard users" and makes administrator creation opt-in. `ActiveDirectory-Provisioner.ps1` requires an explicit `-PasswordFile` for credential export.
+Two hidden compatibility parameters, `-TreatZeroAccountCountAsNone` and `-DisableDepartmentAdministratorsByDefault`, exist for the wrapper scripts and are not meant for direct use. `-RollbackOnFailure` and `-RollbackAccountsOnFailure` are aliases of `-RollbackCreatedAccountsOnFailure` on `mark42.ps1`; `Invoke-ADAutoXProvision.ps1` has a separate `-RollbackOnFailure` switch. Notably, `-AccountCount 0` on `mark42.ps1` means "all valid names", while the `Generate-ADUsers.ps1` wrapper keeps its older meaning of "no standard users" and makes administrator creation opt-in. `ActiveDirectory-Provisioner.ps1` requires `-Password` or `-PasswordPattern` for a live run and an explicit `-PasswordFile` for credential export.
 
 The CSV report records domain, forest, DC, operator, computer, PowerShell version, run time, and per-account username, name, department, role, target OU, status, stage, timestamp, and error details. A password column exists only with `-IncludePasswordInReport`. Run status distinguishes preview, success, skipped, failed, and partial outcomes, so check the report and audit log before retrying a partial run.
 

@@ -506,6 +506,19 @@ Assert-True ($lifecycleLedgerEntries.Count -eq 2 -and $lifecycleLedgerEntries[0]
     'Lifecycle changes can be stored in the shared rollback ledger as reversible undo entries'
 Initialize-ADAutoXLedger
 
+$autoXModule = Get-Module -Name ADAutoX -ErrorAction Stop
+$null = $autoXModule.SessionState.PSVariable.Remove('ADAutoXLedgerSequence')
+$noOpLedgerRunId = [Guid]::NewGuid().ToString()
+$recoveredLedgerEntry = Add-ADAutoXLedgerEntry -ObjectType OU `
+    -DistinguishedName 'OU=Existing,DC=example,DC=com' -Name 'Existing' `
+    -RunId $noOpLedgerRunId -CreatedByThisRun $false
+$sequenceRecoveryValid = $recoveredLedgerEntry.Sequence -eq 1 -and
+    -not $recoveredLedgerEntry.CreatedByThisRun -and
+    @((Get-ADAutoXLedger) | Where-Object RunId -eq $noOpLedgerRunId).Count -eq 1
+Assert-True $sequenceRecoveryValid `
+    'Shared ledger writer recovers an unset sequence and preserves pre-existing resources as non-rollback entries'
+Initialize-ADAutoXLedger
+
 $contractRunId = [Guid]::NewGuid().ToString()
 $contractEntries = @(
     Add-ADAutoXLedgerEntry -ObjectType OU -DistinguishedName 'OU=Offline,DC=example,DC=com' `
@@ -699,6 +712,9 @@ Assert-True ($ledgerAdapterSource.Contains('Add-ADAutoXLedgerEntry') -and
     $ledgerAdapterSource.Contains('-RunId $CorrelationId') -and
     $ledgerAdapterSource.Contains('GeneratedDescription = $generatedOUDescription')) `
     'Provisioning resource ledger compatibility adapter delegates all entries to the shared writer and preserves rollback metadata'
+Assert-True ($provisioningScriptAst.Extent.Text.Contains('$runCreatedResourceCount -eq 0') -and
+    $provisioningScriptAst.Extent.Text.Contains('Status          : NOTHING TO DO (Ledger: $($runLedgerEntries.Count) entries; 0 created by this run)')) `
+    'Provisioning reports a clear no-op result only when no account or rollback-owned resource was created'
 $delegationGrant = $provisioningScriptAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Grant-DepartmentUserDelegation' }, $true)
 $delegationGrantSource = if ($delegationGrant) { $delegationGrant.Extent.Text } else { '' }
 $childRuleLedgerIndex = $delegationGrantSource.IndexOf('Add-ResourceLedgerEntry -Type ''Delegation'' -DistinguishedName $TargetOuDistinguishedName -Name $GroupName `', [System.StringComparison]::Ordinal)

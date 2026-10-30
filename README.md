@@ -109,7 +109,7 @@ Company
         └── Administrators
 ```
 
-Names are read from [`Data/sample-names.txt`](./Data/sample-names.txt) by default. Standard users are distributed across departments; generated account names are checked for collisions. Existing compatible resources are reused rather than recreated.
+Names are read from [`Data/sample-names.txt`](./Data/sample-names.txt) by default. Standard users are distributed across departments; generated account names are checked for collisions. Existing compatible resources are reused rather than recreated. Direct `mark42.ps1` runs generate a random password per new account when no password source is supplied. The legacy `ActiveDirectory-Provisioner.ps1` wrapper instead requires an explicit `-Password` or `-PasswordPattern` for live runs.
 
 Provisioning follows four stages:
 
@@ -173,7 +173,7 @@ Every script in `Cmdlets\` is indexed below. Run commands from the repository ro
 | --- | --- |
 | [`mark42.ps1`](./Cmdlets/mark42.ps1) | Canonical bulk provisioner for department OUs, groups, users, administrator accounts, scoped delegation, verification, reports, and eligible rollback. |
 | [`Invoke-ADAutoXProvision.ps1`](./Cmdlets/Invoke-ADAutoXProvision.ps1) | Module-backed provisioning entry point with company/staff OU options and run rollback. |
-| [`ActiveDirectory-Provisioner.ps1`](./Cmdlets/ActiveDirectory-Provisioner.ps1) | Legacy provisioning wrapper; retains older interface conventions. |
+| [`ActiveDirectory-Provisioner.ps1`](./Cmdlets/ActiveDirectory-Provisioner.ps1) | Legacy provisioning wrapper; requires `-Password` or `-PasswordPattern` for a live run. |
 | [`Generate-ADUsers.ps1`](./Cmdlets/Generate-ADUsers.ps1) | Legacy generator wrapper; retains legacy defaults, including the meaning of `-AccountCount 0`. |
 | [`New_User_Script.ps1`](./Cmdlets/New_User_Script.ps1) | Create and verify one user account. |
 | [`Manage-ADAutoXUser.ps1`](./Cmdlets/Manage-ADAutoXUser.ps1) | Lifecycle convenience dispatcher for common user actions. |
@@ -221,8 +221,12 @@ Current manual test evidence:
 
 | Script with evidence | Manual evidence |
 | --- | --- |
-| `2_RESET_TEST_USERS.ps1` | Cleanup implementation invoked through `Remove-Test-Users.ps1`; preview and completion evidence: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
+| `2_RESET_TEST_USERS.ps1` | Live AD query found the `Company` OU and enumerated 25 users, 13 child OUs, and 12 other objects. Both screenshots show a `-WhatIf` preview; they confirm AD connectivity and scope, not completed deletion: [`preview`](./docs/2_RESET_TEST_USERS-WhatIf.png), [`continued preview`](./docs/2_RESET_TEST_USERS-WhatIf-Completed.png). |
+| `ActiveDirectory-Provisioner.ps1` | Successful run against a live AD disposable lab domain: preflight passed 30 checks; the one missing account was created, 23 existing accounts were skipped, and 0 failed. Screenshots: [`preflight`](./docs/ActiveDirectory-Provisioner-Preflight.png), [`completed run`](./docs/ActiveDirectory-Provisioner-Completed.png). The supplied `-SecureString` password was used for the new account. |
+| `ControlConsole.ps1` | The [console screenshot](./docs/ControlConsole.png) shows the menu launching. No option is selected, so it does not demonstrate AD connectivity or a completed AD operation. |
+| `Invoke-ADAutoXUserLifecycle.ps1` | Successfully enabled an account in live AD. The [screenshot](./docs/Invoke-ADAutoXUserLifecycle-Enable.png) shows the target and `Succeeded` result. |
 | `mark42.ps1` | Provisioning evidence: `mark42-tested.png`. |
+| `Manage-ADAutoXUser.ps1` | Resolved the account in live AD and showed a `-WhatIf` disable preview after rejecting the first attempt for missing `-AllowDestructiveOperation`. The [screenshot](./docs/Manage-ADAutoXUser-WhatIf.png) confirms target lookup and preview, not a completed disable. |
 | `New_User_Script.ps1` | Duplicate rejection and user creation: `New_User_Script.png`. |
 | `Remove-Test-Users.ps1` | Cleanup preview and completion: `Remove-Test-Users-WhatIf.png`, `Remove-Test-Users-Completed.png`. |
 | `Reset-ADAutoXEnvironment.ps1` | Reset preview and completion: `Reset-ADAutoXEnvironment-WhatIf.png`, `Reset-ADAutoXEnvironment-Completed.png`. |
@@ -244,6 +248,20 @@ The reset and test-user cleanup workflows are destructive; review their scope an
 
 <details>
 <summary>More manual evidence screenshots</summary>
+
+![ControlConsole menu launch](./docs/ControlConsole.png)
+
+![2_RESET_TEST_USERS.ps1 live AD WhatIf preview](./docs/2_RESET_TEST_USERS-WhatIf.png)
+
+![2_RESET_TEST_USERS.ps1 live AD WhatIf preview continued](./docs/2_RESET_TEST_USERS-WhatIf-Completed.png)
+
+![ActiveDirectory-Provisioner.ps1 live AD preflight](./docs/ActiveDirectory-Provisioner-Preflight.png)
+
+![ActiveDirectory-Provisioner.ps1 completed live AD provisioning summary](./docs/ActiveDirectory-Provisioner-Completed.png)
+
+![Manage-ADAutoXUser.ps1 live AD target lookup and WhatIf disable preview](./docs/Manage-ADAutoXUser-WhatIf.png)
+
+![Invoke-ADAutoXUserLifecycle.ps1 successful live AD enable](./docs/Invoke-ADAutoXUserLifecycle-Enable.png)
 
 ![Script_Terminate_User.ps1 preview and run](./docs/Script_Terminate_User.png)
 

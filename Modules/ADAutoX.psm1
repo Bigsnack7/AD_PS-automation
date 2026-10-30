@@ -319,7 +319,9 @@ function Invoke-ADAutoXProvision {
 }
 
 $script:ADAutoXLedger = [System.Collections.Generic.List[psobject]]::new()
-$script:ADAutoXLedgerSequence = 0
+if (-not (Test-Path variable:script:ADAutoXLedgerSequence)) {
+    $script:ADAutoXLedgerSequence = 0
+}
 
 function Test-ADAutoXDomainReachability {
     [CmdletBinding()]
@@ -433,6 +435,9 @@ function Add-ADAutoXLedgerEntry {
     }
     if (-not $Name) {
         $Name = if ($SamAccountName) { $SamAccountName } else { $DistinguishedName }
+    }
+    if (-not (Test-Path variable:script:ADAutoXLedgerSequence)) {
+        $script:ADAutoXLedgerSequence = 0
     }
     $script:ADAutoXLedgerSequence++
     $entry = [pscustomobject]@{

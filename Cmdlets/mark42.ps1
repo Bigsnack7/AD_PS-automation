@@ -2420,6 +2420,11 @@ if (-not $WhatIfPreference -and $ExportPasswords -and $PasswordFile -and $passwo
 }
 
 $totalCreated = $createdCount + $createdAdminCount
+$runLedgerEntries = @(Get-ADAutoXLedger | Where-Object { $_.RunId -ceq $CorrelationId })
+$runCreatedResourceCount = @($runLedgerEntries | Where-Object CreatedByThisRun).Count
+$nothingToDo = -not $WhatIfPreference -and
+    $totalCreated -eq 0 -and $failedCount -eq 0 -and $partialCount -eq 0 -and
+    $runCreatedResourceCount -eq 0
 $auditStatus = if ($WhatIfPreference) {
     'Preview'
 }
@@ -2461,6 +2466,9 @@ $summaryLines = @(
     }
     elseif ($failedCount -gt 0 -or $partialCount -gt 0) {
         'Status          : COMPLETED WITH ERRORS'
+    }
+    elseif ($nothingToDo) {
+        "Status          : NOTHING TO DO (Ledger: $($runLedgerEntries.Count) entries; 0 created by this run)"
     }
     elseif ($totalCreated -eq 0) {
         'Status          : SKIPPED'
