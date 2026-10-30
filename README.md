@@ -225,6 +225,13 @@ Current manual test evidence:
 | `ActiveDirectory-Provisioner.ps1` | Successful run against a live AD disposable lab domain: preflight passed 30 checks; the one missing account was created, 23 existing accounts were skipped, and 0 failed. Screenshots: [`preflight`](./docs/ActiveDirectory-Provisioner-Preflight.png), [`completed run`](./docs/ActiveDirectory-Provisioner-Completed.png). The supplied `-SecureString` password was used for the new account. |
 | `ControlConsole.ps1` | The [console screenshot](./docs/ControlConsole.png) shows the menu launching. No option is selected, so it does not demonstrate AD connectivity or a completed AD operation. |
 | `Invoke-ADAutoXUserLifecycle.ps1` | Successfully enabled an account in live AD. The [screenshot](./docs/Invoke-ADAutoXUserLifecycle-Enable.png) shows the target and `Succeeded` result. |
+| `Invoke-ADAutoXProvision.ps1` | Reran against live AD with the requested objects already present: 0 created, 0 failed, 0 partial, and 24 skipped. The summary reported `NOTHING TO DO` (30 ledger entries; 0 created by this run). [Screenshot](./docs/Invoke-ADAutoXProvision-Existing-Objects.png). |
+| `Get-ADAutoXSecurityScan.ps1` | Completed a read-only scan against live AD: 29 accounts found, 0 locked out, 2 with passwords set to never expire, 0 inactive, and 4 disabled. [Screenshot](./docs/Get-ADAutoXSecurityScan-Live-AD.png). |
+| `Get-ADAutoXLockedOutUsers.ps1` | Ran the read-only locked-account query against live AD. It returned no records, consistent with no accounts being locked out. [Screenshot](./docs/Get-ADAutoXLockedOutUsers-No-Locked-Accounts.png). |
+| `Get-ADAutoXAuditReport.ps1` | Retrieved and displayed 39 matching audit entries from the live-AD audit log. [Screenshot](./docs/Get-ADAutoXAuditReport-Live-AD.png). |
+| `Generate-ADUsers.ps1` | Live AD preflight passed all 14 checks (0 pending, 0 failed); all 20 requested users were already present and skipped, with 0 created, 0 failures, and 0 admins created. The run reported `NOTHING TO DO` (14 ledger entries; 0 created by this run). Screenshots: [`preflight`](./docs/Generate-ADUsers-Live-AD-Preflight.png), [`no-op completion`](./docs/Generate-ADUsers-Live-AD-Completed.png). |
+| `Export-Test-Users.ps1` | Completed a live-AD user export and reported the CSV output. This performs AD reads and writes the report file; the screenshot redacts the domain and local output path. [Screenshot](./docs/Export-Test-Users-Live-AD.png). |
+| `Disable-ADAutoXInactiveUsers.ps1` | Ran against live AD with a scoped `-SearchBase` and `-WhatIf`; the command returned to the prompt without a visible error. This verifies the preview invocation only: no accounts were disabled, and the screenshot does not show whether any inactive accounts matched. [Screenshot](./docs/Disable-ADAutoXInactiveUsers-Live-AD-WhatIf.png). |
 | `mark42.ps1` | Provisioning evidence: `mark42-tested.png`. |
 | `Manage-ADAutoXUser.ps1` | Resolved the account in live AD and showed a `-WhatIf` disable preview after rejecting the first attempt for missing `-AllowDestructiveOperation`. The [screenshot](./docs/Manage-ADAutoXUser-WhatIf.png) confirms target lookup and preview, not a completed disable. |
 | `New_User_Script.ps1` | Duplicate rejection and user creation: `New_User_Script.png`. |
@@ -262,6 +269,22 @@ The reset and test-user cleanup workflows are destructive; review their scope an
 ![Manage-ADAutoXUser.ps1 live AD target lookup and WhatIf disable preview](./docs/Manage-ADAutoXUser-WhatIf.png)
 
 ![Invoke-ADAutoXUserLifecycle.ps1 successful live AD enable](./docs/Invoke-ADAutoXUserLifecycle-Enable.png)
+
+![Invoke-ADAutoXProvision.ps1 live AD no-op run with existing objects](./docs/Invoke-ADAutoXProvision-Existing-Objects.png)
+
+![Get-ADAutoXSecurityScan.ps1 live AD read-only report](./docs/Get-ADAutoXSecurityScan-Live-AD.png)
+
+![Get-ADAutoXLockedOutUsers.ps1 live AD query with no locked accounts](./docs/Get-ADAutoXLockedOutUsers-No-Locked-Accounts.png)
+
+![Get-ADAutoXAuditReport.ps1 showing matching live-AD audit entries](./docs/Get-ADAutoXAuditReport-Live-AD.png)
+
+![Generate-ADUsers.ps1 live AD preflight with 14 checks passed](./docs/Generate-ADUsers-Live-AD-Preflight.png)
+
+![Generate-ADUsers.ps1 live AD no-op completion with all requested users skipped](./docs/Generate-ADUsers-Live-AD-Completed.png)
+
+![Export-Test-Users.ps1 successful live-AD export with domain and local path redacted](./docs/Export-Test-Users-Live-AD.png)
+
+![Disable-ADAutoXInactiveUsers.ps1 scoped live-AD WhatIf invocation; no changes applied](./docs/Disable-ADAutoXInactiveUsers-Live-AD-WhatIf.png)
 
 ![Script_Terminate_User.ps1 preview and run](./docs/Script_Terminate_User.png)
 
